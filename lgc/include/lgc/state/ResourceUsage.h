@@ -79,16 +79,17 @@ union XfbOutInfo {
 
 // Represents interpolation info of fragment shader input
 struct FsInterpInfo {
-  unsigned loc; // Mapped input location (tightly packed)
-  bool flat;    // Whether it is "flat" interpolation
-  bool custom;  // Whether it is "custom" interpolation
-  bool is16bit; // Whether it is 16-bit interpolation
-  bool attr0Valid; // Whether the location has a valid low half
-  bool attr1Valid; // Wheterh the location has a valid high half
+  unsigned loc;        // Mapped input location (tightly packed)
+  bool flat;           // Whether it is "flat" interpolation
+  bool custom;         // Whether it is "custom" interpolation
+  bool is16bit;        // Whether it is 16-bit interpolation
+  bool attr0Valid;     // Whether the location has a valid low half
+  bool attr1Valid;     // Wheterh the location has a valid high half
+  bool isPerPrimitive; // Whether it is per-primitive
 };
 
 // Invalid interpolation info
-static const FsInterpInfo InvalidFsInterpInfo = {InvalidValue, false, false, false, false, false};
+static const FsInterpInfo InvalidFsInterpInfo = {InvalidValue, false, false, false, false, false, false};
 
 // Represents the location information on an input or output
 class InOutLocationInfo {
@@ -154,6 +155,10 @@ struct ResourceUsage {
   unsigned numSgprsAvailable = UINT32_MAX; // Number of available SGPRs
   unsigned numVgprsAvailable = UINT32_MAX; // Number of available VGPRs
   bool useImages = false;                  // Whether images are used
+
+#if VKI_RAY_TRACING
+  bool useRayQueryLdsStack = false; // Whether ray query uses LDS stack
+#endif
 
   // Usage of built-ins
   struct {
@@ -241,6 +246,30 @@ struct ResourceUsage {
         unsigned primitiveShadingRate : 1; // Whether gl_PrimitiveShadingRate is used
       } gs;
 
+      // Mesh shader
+      struct {
+        // Input
+        unsigned drawIndex : 1;            // Whether gl_DrawIDARB is used
+        unsigned viewIndex : 1;            // Whether gl_ViewIndex is used
+        unsigned numWorkgroups : 1;        // Whether gl_NumWorkGroups is used
+        unsigned workgroupId : 1;          // Whether gl_WorkGroupID is used
+        unsigned localInvocationId : 1;    // Whether gl_LocalInvocationID is used
+        unsigned globalInvocationId : 1;   // Whether gl_GlobalInvocationID is used
+        unsigned localInvocationIndex : 1; // Whether gl_LocalInvocationIndex is used
+        unsigned subgroupId : 1;           // Whether gl_SubgroupID is used
+        unsigned numSubgroups : 1;         // Whether gl_NumSubgroups is used
+        // Output
+        unsigned pointSize : 1;            // Whether gl_PointSize is used
+        unsigned position : 1;             // Whether gl_Position is used
+        unsigned clipDistance : 4;         // Array size gl_ClipDistance[] (0 means unused)
+        unsigned cullDistance : 4;         // Array size gl_CullDistance[] (0 means unused)
+        unsigned primitiveId : 1;          // Whether gl_PrimitiveID is used
+        unsigned viewportIndex : 1;        // Whether gl_ViewportIndex is used
+        unsigned layer : 1;                // Whether gl_Layer is used
+        unsigned cullPrimitive : 1;        // Whether gl_CullPrimitive is used
+        unsigned primitiveShadingRate : 1; // Whether gl_PrimitiveShadingRate is used
+      } mesh;
+
       // Fragment shader
       struct {
         // Interpolation
@@ -304,12 +333,18 @@ struct ResourceUsage {
     std::map<unsigned, unsigned> perPatchInputLocMap;
     std::map<unsigned, unsigned> perPatchOutputLocMap;
 
+    std::map<unsigned, unsigned> perPrimitiveInputLocMap;
+    std::map<unsigned, unsigned> perPrimitiveOutputLocMap;
+
     // Map from built-in IDs to specially assigned locations
     std::map<unsigned, unsigned> builtInInputLocMap;
     std::map<unsigned, unsigned> builtInOutputLocMap;
 
     std::map<unsigned, unsigned> perPatchBuiltInInputLocMap;
     std::map<unsigned, unsigned> perPatchBuiltInOutputLocMap;
+
+    std::map<unsigned, unsigned> perPrimitiveBuiltInInputLocMap;
+    std::map<unsigned, unsigned> perPrimitiveBuiltInOutputLocMap;
 
     // Transform feedback strides
     unsigned xfbStrides[MaxTransformFeedbackBuffers] = {};
@@ -326,8 +361,11 @@ struct ResourceUsage {
     unsigned outputMapLocCount = 0;
     unsigned perPatchInputMapLocCount = 0;
     unsigned perPatchOutputMapLocCount = 0;
+    unsigned perPrimitiveInputMapLocCount = 0;
+    unsigned perPrimitiveOutputMapLocCount = 0;
 
-    unsigned expCount = 0; // Export count (number of "exp" instructions) for generic outputs
+    unsigned expCount = 0;     // Export count (number of "exp" instructions) for generic per-vertex outputs
+    unsigned primExpCount = 0; // Export count (number of "exp" instructions) for generic per-primitive outputs
 
     struct {
       struct {
@@ -363,6 +401,9 @@ struct ResourceUsage {
         unsigned tessFactorStride; // Size of tess factor stride (in dword)
 
         unsigned tessOnChipLdsSize; // On-chip LDS size (exclude off-chip LDS buffer) (in dword)
+#if VKI_RAY_TRACING
+        unsigned rayQueryLdsStackSize; // Ray query LDS stack size
+#endif
 
         bool initialized; // Whether calcFactor has been initialized
       } calcFactor;
@@ -371,7 +412,7 @@ struct ResourceUsage {
     struct {
       // Map from IDs of built-in outputs to locations of generic outputs (used by copy shader to export built-in
       // outputs to fragment shader, always from vertex stream 0)
-      std::unordered_map<unsigned, unsigned> builtInOutLocs;
+      std::map<unsigned, unsigned> builtInOutLocs;
 
       // Map from tightly packed locations to byte sizes of generic outputs (used by copy shader to
       // export generic outputs to fragment shader, always from vertex stream 0):
@@ -394,10 +435,28 @@ struct ResourceUsage {
         unsigned inputVertices;      // Number of GS input vertices
         unsigned primAmpFactor;      // GS primitive amplification factor
         bool enableMaxVertOut;       // Whether to allow each GS instance to emit maximum vertices (NGG)
+#if VKI_RAY_TRACING
+        unsigned rayQueryLdsStackSize; // Ray query LDS stack size
+#endif
       } calcFactor = {};
 
       unsigned outLocCount[MaxGsStreams] = {};
     } gs;
+
+    struct {
+      // Map from IDs of built-in outputs to locations of generic per-vertex outputs (used by vertex export to export
+      // built-in outputs to fragment shader)
+      std::map<BuiltInKind, unsigned> builtInExportLocs;
+
+      // Map from IDs of per-primitive built-in outputs to locations of generic per-primitive outputs (used by vertex
+      // export to export built-in outputs to fragment shader)
+      std::map<BuiltInKind, unsigned> perPrimitiveBuiltInExportLocs;
+
+      // Count of mapped location for generic outputs (excluding those special locations to which the built-ins
+      // are mapped)
+      unsigned genericOutputMapLocCount = 0;
+      unsigned perPrimitiveGenericOutputMapLocCount = 0;
+    } mesh;
 
     struct {
       // Original shader specified locations before location map (from tightly packed locations to shader
@@ -514,6 +573,16 @@ struct InterfaceData {
         unsigned viewIndex;                       // View Index
         StreamOutData streamOutData;              // Stream-out Data
       } gs;
+
+      // Mesh shader
+      struct {
+        unsigned drawIndex;          // Draw index
+        unsigned viewIndex;          // View index
+        unsigned dispatchDims;       // Dispatch dimensions
+        unsigned baseRingEntryIndex; // Base entry index (first workgroup) of mesh/task shader ring for current dispatch
+        unsigned pipeStatsBuf;       // Pipeline statistics buffer
+        unsigned flatWorkgroupId;    // Flat workgroup ID (emulated by HW vertex ID)
+      } mesh;
 
       // Fragment shader
       struct {

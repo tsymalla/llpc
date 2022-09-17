@@ -37,7 +37,6 @@
 #include "lgc/state/AbiUnlinked.h"
 #include "lgc/state/PipelineShaders.h"
 #include "lgc/util/Debug.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/Debug.h"
@@ -411,6 +410,16 @@ void PatchInOutImportExport::processShader() {
 
       calcFactor.tessOnChipLdsSize = calcFactor.onChip.tessFactorStart + tessFactorTotalSize;
 
+#if VKI_RAY_TRACING
+      // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
+      // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
+      // restriction by providing the capability of querying thread ID in group rather than in wave.
+      const auto vsResUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex);
+      const auto tcsResUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
+      if (vsResUsage->useRayQueryLdsStack || tcsResUsage->useRayQueryLdsStack)
+        calcFactor.rayQueryLdsStackSize = MaxRayQueryLdsStackEntries * MaxRayQueryThreadsPerGroup;
+#endif
+
       LLPC_OUTS("===============================================================================\n");
       LLPC_OUTS("// LLPC tessellation calculation factor results\n\n");
       LLPC_OUTS("Patch count per thread group: " << calcFactor.patchCountPerThreadGroup << "\n");
@@ -456,6 +465,12 @@ void PatchInOutImportExport::processShader() {
       }
       LLPC_OUTS(")\n\n");
       LLPC_OUTS("Tess on-chip LDS total size (in dwords): " << calcFactor.tessOnChipLdsSize << "\n");
+#if VKI_RAY_TRACING
+      if (calcFactor.rayQueryLdsStackSize > 0) {
+        LLPC_OUTS("Ray query LDS stack size (in dwords): " << calcFactor.rayQueryLdsStackSize
+                                                           << " (start = " << calcFactor.tessOnChipLdsSize << ")\n");
+      }
+#endif
       LLPC_OUTS("\n");
     }
   }
@@ -531,7 +546,9 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
   if (!callee)
     return;
 
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
+  builder.SetInsertPoint(&callInst);
+
   auto resUsage = m_pipelineState->getShaderResourceUsage(m_shaderStage);
 
   auto mangledName = callee->getName();
@@ -582,7 +599,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
 
       switch (m_shaderStage) {
       case ShaderStageVertex: {
-        input = patchVsBuiltInInputImport(inputTy, builtInId, &callInst);
+        input = patchVsBuiltInInputImport(inputTy, builtInId, builder);
         break;
       }
       case ShaderStageTessControl: {
@@ -595,7 +612,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         if (callInst.arg_size() > 2)
           vertexIdx = isDontCareValue(callInst.getOperand(2)) ? nullptr : callInst.getOperand(2);
 
-        input = patchTcsBuiltInInputImport(inputTy, builtInId, elemIdx, vertexIdx, &callInst);
+        input = patchTcsBuiltInInputImport(inputTy, builtInId, elemIdx, vertexIdx, builder);
         break;
       }
       case ShaderStageTessEval: {
@@ -607,7 +624,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
 
         if (callInst.arg_size() > 2)
           vertexIdx = isDontCareValue(callInst.getOperand(2)) ? nullptr : callInst.getOperand(2);
-        input = patchTesBuiltInInputImport(inputTy, builtInId, elemIdx, vertexIdx, &callInst);
+        input = patchTesBuiltInInputImport(inputTy, builtInId, elemIdx, vertexIdx, builder);
         break;
       }
       case ShaderStageGeometry: {
@@ -616,14 +633,20 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         if (callInst.arg_size() > 1)
           vertexIdx = isDontCareValue(callInst.getOperand(1)) ? nullptr : callInst.getOperand(1);
 
-        input = patchGsBuiltInInputImport(inputTy, builtInId, vertexIdx, &callInst);
+        input = patchGsBuiltInInputImport(inputTy, builtInId, vertexIdx, builder);
+        break;
+      }
+      case ShaderStageMesh: {
+        assert(callInst.arg_size() == 2);
+        Value *elemIdx = isDontCareValue(callInst.getOperand(1)) ? nullptr : callInst.getOperand(1);
+        input = patchMeshBuiltInInputImport(inputTy, builtInId, elemIdx, builder);
         break;
       }
       case ShaderStageFragment: {
         Value *generalVal = nullptr;
         if (callInst.arg_size() >= 2)
           generalVal = callInst.getArgOperand(1);
-        input = patchFsBuiltInInputImport(inputTy, builtInId, generalVal, &callInst);
+        input = patchFsBuiltInInputImport(inputTy, builtInId, generalVal, builder);
         break;
       }
       default: {
@@ -632,6 +655,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
       }
       }
     } else {
+      assert(m_shaderStage != ShaderStageVertex && "vertex fetch is handled by LowerVertexFetch");
       assert(isGenericInputImport || isInterpolantInputImport);
 
       unsigned loc = InvalidValue;
@@ -639,70 +663,71 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
       Value *elemIdx = nullptr;
       bool highHalf = false;
 
-      if (m_shaderStage == ShaderStageVertex) {
-        // NOTE: For vertex shader, generic inputs are not mapped.
-        loc = value;
-      } else {
-        if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval ||
-            (m_shaderStage == ShaderStageFragment && isInterpolantInputImport)) {
-          // NOTE: If location offset is present and is a constant, we have to add it to the unmapped
-          // location before querying the mapped location. Meanwhile, we have to adjust the location
-          // offset to 0 (rebase it).
-          locOffset = callInst.getOperand(1);
-          if (isa<ConstantInt>(locOffset)) {
-            value += cast<ConstantInt>(locOffset)->getZExtValue();
-            locOffset = ConstantInt::get(Type::getInt32Ty(*m_context), 0);
-          }
+      if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageTessEval ||
+          (m_shaderStage == ShaderStageFragment && isInterpolantInputImport)) {
+        // NOTE: If location offset is present and is a constant, we have to add it to the unmapped
+        // location before querying the mapped location. Meanwhile, we have to adjust the location
+        // offset to 0 (rebase it).
+        locOffset = callInst.getOperand(1);
+        if (isa<ConstantInt>(locOffset)) {
+          value += cast<ConstantInt>(locOffset)->getZExtValue();
+          locOffset = ConstantInt::get(Type::getInt32Ty(*m_context), 0);
         }
+      }
 
-        InOutLocationInfo origLocInfo;
-        origLocInfo.setLocation(value);
-        auto locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
-        if (m_shaderStage == ShaderStageTessEval) {
-          // NOTE: For generic inputs of tessellation evaluation shader, they could be per-patch ones.
-          if (locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end()) {
-            loc = locInfoMapIt->second.getLocation();
-          } else {
-            assert(resUsage->inOutUsage.perPatchInputLocMap.find(value) !=
-                   resUsage->inOutUsage.perPatchInputLocMap.end());
-            loc = resUsage->inOutUsage.perPatchInputLocMap[value];
-          }
+      InOutLocationInfo origLocInfo;
+      origLocInfo.setLocation(value);
+      auto locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
+      if (m_shaderStage == ShaderStageTessEval ||
+          (m_shaderStage == ShaderStageFragment &&
+           (m_pipelineState->getPrevShaderStage(m_shaderStage) == ShaderStageMesh || m_pipelineState->isUnlinked()))) {
+        // NOTE: For generic inputs of tessellation evaluation shader or fragment shader whose previous shader stage
+        // is mesh shader or is in unlinked pipeline, they could be per-patch ones or per-primitive ones.
+        if (locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end()) {
+          loc = locInfoMapIt->second.getLocation();
+        } else if (resUsage->inOutUsage.perPatchInputLocMap.find(value) !=
+                   resUsage->inOutUsage.perPatchInputLocMap.end()) {
+          loc = resUsage->inOutUsage.perPatchInputLocMap[value];
         } else {
-          if (m_pipelineState->canPackInput(m_shaderStage)) {
-            // The inputLocInfoMap of {TCS, GS, FS} maps original InOutLocationInfo to tightly compact InOutLocationInfo
-            const bool isTcs = m_shaderStage == ShaderStageTessControl;
-            const uint32_t elemIdxArgIdx = (isInterpolantInputImport || isTcs) ? 2 : 1;
-            bool hasDynIndex = false;
-            if (isTcs) {
-              hasDynIndex = !isa<ConstantInt>(callInst.getOperand(1)) || !isa<ConstantInt>(callInst.getOperand(2));
-              if (!hasDynIndex) {
-                // TCS input calls at the same location may have dynamic indexing or not
-                // Try the key as combination of location and component at first
-                origLocInfo.setComponent(cast<ConstantInt>(callInst.getOperand(elemIdxArgIdx))->getZExtValue());
-                locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
-                if (locInfoMapIt == resUsage->inOutUsage.inputLocInfoMap.end()) {
-                  // Try the key as the plain location
-                  origLocInfo.setComponent(0);
-                  locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
-                  hasDynIndex = true;
-                }
-              } else {
-                locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
-              }
-            } else {
+          assert(resUsage->inOutUsage.perPrimitiveInputLocMap.find(value) !=
+                 resUsage->inOutUsage.perPrimitiveInputLocMap.end());
+          loc = resUsage->inOutUsage.perPrimitiveInputLocMap[value];
+        }
+      } else {
+        if (m_pipelineState->canPackInput(m_shaderStage)) {
+          // The inputLocInfoMap of {TCS, GS, FS} maps original InOutLocationInfo to tightly compact InOutLocationInfo
+          const bool isTcs = m_shaderStage == ShaderStageTessControl;
+          const uint32_t elemIdxArgIdx = (isInterpolantInputImport || isTcs) ? 2 : 1;
+          bool hasDynIndex = false;
+          if (isTcs) {
+            hasDynIndex = !isa<ConstantInt>(callInst.getOperand(1)) || !isa<ConstantInt>(callInst.getOperand(2));
+            if (!hasDynIndex) {
+              // TCS input calls at the same location may have dynamic indexing or not
+              // Try the key as combination of location and component at first
               origLocInfo.setComponent(cast<ConstantInt>(callInst.getOperand(elemIdxArgIdx))->getZExtValue());
               locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
+              if (locInfoMapIt == resUsage->inOutUsage.inputLocInfoMap.end()) {
+                // Try the key as the plain location
+                origLocInfo.setComponent(0);
+                locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
+                hasDynIndex = true;
+              }
+            } else {
+              locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
             }
-            assert(locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end());
-
-            loc = locInfoMapIt->second.getLocation();
-            if (!hasDynIndex)
-              elemIdx = builder.getInt32(locInfoMapIt->second.getComponent());
-            highHalf = locInfoMapIt->second.isHighHalf();
           } else {
-            assert(locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end());
-            loc = locInfoMapIt->second.getLocation();
+            origLocInfo.setComponent(cast<ConstantInt>(callInst.getOperand(elemIdxArgIdx))->getZExtValue());
+            locInfoMapIt = resUsage->inOutUsage.inputLocInfoMap.find(origLocInfo);
           }
+          assert(locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end());
+
+          loc = locInfoMapIt->second.getLocation();
+          if (!hasDynIndex)
+            elemIdx = builder.getInt32(locInfoMapIt->second.getComponent());
+          highHalf = locInfoMapIt->second.isHighHalf();
+        } else {
+          assert(locInfoMapIt != resUsage->inOutUsage.inputLocInfoMap.end());
+          loc = locInfoMapIt->second.getLocation();
         }
       }
       assert(loc != InvalidValue);
@@ -719,7 +744,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         auto vertexIdx = callInst.getOperand(3);
         assert(isDontCareValue(vertexIdx) == false);
 
-        input = patchTcsGenericInputImport(inputTy, loc, locOffset, elemIdx, vertexIdx, &callInst);
+        input = patchTcsGenericInputImport(inputTy, loc, locOffset, elemIdx, vertexIdx, builder);
         break;
       }
       case ShaderStageTessEval: {
@@ -730,7 +755,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
 
         auto vertexIdx = isDontCareValue(callInst.getOperand(3)) ? nullptr : callInst.getOperand(3);
 
-        input = patchTesGenericInputImport(inputTy, loc, locOffset, elemIdx, vertexIdx, &callInst);
+        input = patchTesGenericInputImport(inputTy, loc, locOffset, elemIdx, vertexIdx, builder);
         break;
       }
       case ShaderStageGeometry: {
@@ -744,12 +769,13 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         Value *vertexIdx = callInst.getOperand(2);
         assert(isDontCareValue(vertexIdx) == false);
 
-        input = patchGsGenericInputImport(inputTy, loc, compIdx, vertexIdx, &callInst);
+        input = patchGsGenericInputImport(inputTy, loc, compIdx, vertexIdx, builder);
         break;
       }
       case ShaderStageFragment: {
         unsigned interpMode = InOutInfo::InterpModeSmooth;
         unsigned interpLoc = InOutInfo::InterpLocCenter;
+        bool isPerPrimitive = false;
 
         if (!elemIdx)
           elemIdx = callInst.getOperand(isInterpolantInputImport ? 2 : 1);
@@ -758,10 +784,11 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         Value *auxInterpValue = nullptr;
 
         if (isGenericInputImport) {
-          assert(callInst.arg_size() == 4);
+          assert(callInst.arg_size() == 5);
 
-          interpMode = cast<ConstantInt>(callInst.getOperand(2))->getZExtValue();
-          interpLoc = cast<ConstantInt>(callInst.getOperand(3))->getZExtValue();
+          isPerPrimitive = cast<ConstantInt>(callInst.getOperand(2))->getZExtValue() != 0;
+          interpMode = cast<ConstantInt>(callInst.getOperand(3))->getZExtValue();
+          interpLoc = cast<ConstantInt>(callInst.getOperand(4))->getZExtValue();
         } else {
           assert(isInterpolantInputImport);
           assert(callInst.arg_size() == 5);
@@ -772,8 +799,8 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
           auxInterpValue = callInst.getOperand(4);
         }
 
-        input = patchFsGenericInputImport(inputTy, loc, locOffset, elemIdx, auxInterpValue, interpMode, interpLoc,
-                                          highHalf, &callInst);
+        input = patchFsGenericInputImport(inputTy, loc, locOffset, elemIdx, isPerPrimitive, auxInterpValue, interpMode,
+                                          interpLoc, highHalf, builder);
         break;
       }
       default: {
@@ -806,7 +833,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
       Value *elemIdx = isDontCareValue(callInst.getOperand(1)) ? nullptr : callInst.getOperand(1);
       Value *vertexIdx = isDontCareValue(callInst.getOperand(2)) ? nullptr : callInst.getOperand(2);
 
-      output = patchTcsBuiltInOutputImport(outputTy, builtInId, elemIdx, vertexIdx, &callInst);
+      output = patchTcsBuiltInOutputImport(outputTy, builtInId, elemIdx, vertexIdx, builder);
     } else {
       assert(isGenericOutputImport);
 
@@ -838,7 +865,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
       assert(isDontCareValue(elemIdx) == false);
       auto vertexIdx = isDontCareValue(callInst.getOperand(3)) ? nullptr : callInst.getOperand(3);
 
-      output = patchTcsGenericOutputImport(outputTy, loc, locOffset, elemIdx, vertexIdx, &callInst);
+      output = patchTcsGenericOutputImport(outputTy, loc, locOffset, elemIdx, vertexIdx, builder);
     }
 
     callInst.replaceAllUsesWith(output);
@@ -915,6 +942,15 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         patchGsBuiltInOutputExport(output, builtInId, resUsage->inOutUsage.gs.rasterStream, &callInst);
         break;
       }
+      case ShaderStageMesh: {
+        assert(callInst.arg_size() == 5);
+        Value *elemIdx = isDontCareValue(callInst.getOperand(1)) ? nullptr : callInst.getOperand(1);
+        Value *vertexOrPrimitiveIdx = callInst.getOperand(2);
+        bool isPerPrimitive = cast<ConstantInt>(callInst.getOperand(3))->getZExtValue() != 0;
+
+        patchMeshBuiltInOutputExport(output, builtInId, elemIdx, vertexOrPrimitiveIdx, isPerPrimitive, &callInst);
+        break;
+      }
       case ShaderStageFragment: {
         patchFsBuiltInOutputExport(output, builtInId, &callInst);
         break;
@@ -942,16 +978,11 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         origLocInfo.setStreamId(cast<ConstantInt>(callInst.getOperand(2))->getZExtValue());
       auto locInfoMapIt = resUsage->inOutUsage.outputLocInfoMap.find(origLocInfo);
 
-      if (m_shaderStage == ShaderStageTessControl) {
-        // NOTE: If location offset is a constant, we have to add it to the unmapped location before querying
-        // the mapped location. Meanwhile, we have to adjust the location offset to 0 (rebase it).
+      if (m_shaderStage == ShaderStageTessControl || m_shaderStage == ShaderStageMesh) {
         locOffset = callInst.getOperand(1);
-        if (isa<ConstantInt>(locOffset)) {
-          value += cast<ConstantInt>(locOffset)->getZExtValue();
-          locOffset = ConstantInt::get(Type::getInt32Ty(*m_context), 0);
-        }
 
-        // NOTE: For generic outputs of tessellation control shader, they could be per-patch ones.
+        // NOTE: For generic outputs of tessellation control shader or mesh shader, they could be per-patch ones or
+        // per-primitive ones.
         if (locInfoMapIt != resUsage->inOutUsage.outputLocInfoMap.end()) {
           exist = true;
           loc = locInfoMapIt->second.getLocation();
@@ -959,6 +990,10 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
                    resUsage->inOutUsage.perPatchOutputLocMap.end()) {
           exist = true;
           loc = resUsage->inOutUsage.perPatchOutputLocMap[value];
+        } else if (resUsage->inOutUsage.perPrimitiveOutputLocMap.find(value) !=
+                   resUsage->inOutUsage.perPrimitiveOutputLocMap.end()) {
+          exist = true;
+          loc = resUsage->inOutUsage.perPrimitiveOutputLocMap[value];
         }
       } else if (m_shaderStage == ShaderStageCopyShader) {
         exist = true;
@@ -1003,7 +1038,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
           assert(callInst.arg_size() == 3);
           if (elemIdx == InvalidValue)
             elemIdx = cast<ConstantInt>(callInst.getOperand(1))->getZExtValue();
-          patchVsGenericOutputExport(output, loc, elemIdx, &callInst);
+          patchVsGenericOutputExport(output, loc, elemIdx, builder);
           break;
         }
         case ShaderStageTessControl: {
@@ -1014,14 +1049,14 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
 
           auto vertexIdx = isDontCareValue(callInst.getOperand(3)) ? nullptr : callInst.getOperand(3);
 
-          patchTcsGenericOutputExport(output, loc, locOffset, elemIdx, vertexIdx, &callInst);
+          patchTcsGenericOutputExport(output, loc, locOffset, elemIdx, vertexIdx, builder);
           break;
         }
         case ShaderStageTessEval: {
           assert(callInst.arg_size() == 3);
           if (elemIdx == InvalidValue)
             elemIdx = cast<ConstantInt>(callInst.getOperand(1))->getZExtValue();
-          patchTesGenericOutputExport(output, loc, elemIdx, &callInst);
+          patchTesGenericOutputExport(output, loc, elemIdx, builder);
           break;
         }
         case ShaderStageGeometry: {
@@ -1029,7 +1064,18 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
           if (elemIdx == InvalidValue)
             elemIdx = cast<ConstantInt>(callInst.getOperand(1))->getZExtValue();
           const unsigned streamId = cast<ConstantInt>(callInst.getOperand(2))->getZExtValue();
-          patchGsGenericOutputExport(output, loc, elemIdx, streamId, &callInst);
+          patchGsGenericOutputExport(output, loc, elemIdx, streamId, builder);
+          break;
+        }
+        case ShaderStageMesh: {
+          assert(callInst.arg_size() == 6);
+
+          auto elemIdx = callInst.getOperand(2);
+          assert(isDontCareValue(elemIdx) == false);
+
+          auto vertexOrPrimitiveIdx = callInst.getOperand(3);
+          bool isPerPrimitive = cast<ConstantInt>(callInst.getOperand(4))->getZExtValue() != 0;
+          patchMeshGenericOutputExport(output, loc, locOffset, elemIdx, vertexOrPrimitiveIdx, isPerPrimitive, builder);
           break;
         }
         case ShaderStageFragment: {
@@ -1059,10 +1105,10 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
         auto viewIndex = getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
 
         auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
-        auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+        const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
 
         assert(builtInOutLocMap.find(BuiltInViewIndex) != builtInOutLocMap.end());
-        unsigned loc = builtInOutLocMap[BuiltInViewIndex];
+        unsigned loc = builtInOutLocMap.find(BuiltInViewIndex)->second;
 
         auto rasterStream = resUsage->inOutUsage.gs.rasterStream;
         storeValueToGsVsRing(viewIndex, loc, 0, rasterStream, &callInst);
@@ -1241,6 +1287,8 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
 
     useLayer = enableMultiView || useLayer;
 
+    const auto &builtInOutLocs =
+        m_shaderStage == ShaderStageCopyShader ? inOutUsage.gs.builtInOutLocs : inOutUsage.builtInOutputLocMap;
     const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
     if (nextStage == ShaderStageFragment) {
       useLayer |= nextBuiltInUsage.layer || nextBuiltInUsage.viewIndex;
@@ -1367,22 +1415,11 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       }
 
       if (hasClipCullExport) {
-        unsigned loc = InvalidValue;
-        if (m_shaderStage == ShaderStageCopyShader) {
-          if (inOutUsage.gs.builtInOutLocs.find(BuiltInClipDistance) != inOutUsage.gs.builtInOutLocs.end())
-            loc = inOutUsage.gs.builtInOutLocs[BuiltInClipDistance];
-          else {
-            assert(inOutUsage.gs.builtInOutLocs.find(BuiltInCullDistance) != inOutUsage.gs.builtInOutLocs.end());
-            loc = inOutUsage.gs.builtInOutLocs[BuiltInCullDistance];
-          }
-        } else {
-          if (inOutUsage.builtInOutputLocMap.find(BuiltInClipDistance) != inOutUsage.builtInOutputLocMap.end())
-            loc = inOutUsage.builtInOutputLocMap[BuiltInClipDistance];
-          else {
-            assert(inOutUsage.builtInOutputLocMap.find(BuiltInCullDistance) != inOutUsage.builtInOutputLocMap.end());
-            loc = inOutUsage.builtInOutputLocMap[BuiltInCullDistance];
-          }
-        }
+        auto it = builtInOutLocs.find(BuiltInClipDistance);
+        if (it == builtInOutLocs.end())
+          it = builtInOutLocs.find(BuiltInCullDistance);
+        assert(it != builtInOutLocs.end());
+        const unsigned loc = it->second;
 
         recordVertexAttribExport(loc,
                                  {clipCullDistance[0], clipCullDistance[1], clipCullDistance[2], clipCullDistance[3]});
@@ -1408,14 +1445,8 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
       }
 
       if (hasPrimitiveIdExport) {
-        unsigned loc = InvalidValue;
-        if (m_shaderStage == ShaderStageCopyShader) {
-          assert(inOutUsage.gs.builtInOutLocs.find(BuiltInPrimitiveId) != inOutUsage.gs.builtInOutLocs.end());
-          loc = inOutUsage.gs.builtInOutLocs[BuiltInPrimitiveId];
-        } else {
-          assert(inOutUsage.builtInOutputLocMap.find(BuiltInPrimitiveId) != inOutUsage.builtInOutputLocMap.end());
-          loc = inOutUsage.builtInOutputLocMap[BuiltInPrimitiveId];
-        }
+        assert(builtInOutLocs.find(BuiltInPrimitiveId) != builtInOutLocs.end());
+        const unsigned loc = builtInOutLocs.find(BuiltInPrimitiveId)->second;
 
         assert(m_primitiveId);
         Value *primitiveId = new BitCastInst(m_primitiveId, Type::getFloatTy(*m_context), "", insertPos);
@@ -1423,8 +1454,8 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
         recordVertexAttribExport(loc, {primitiveId, undef, undef, undef});
       }
     }
-    // NOTE: If multi-view is enabled, always do exporting for gl_Layer.
-    if (m_gfxIp.major <= 8 && enableMultiView) {
+
+    if (m_gfxIp.major <= 8 && useLayer) {
       assert(m_layer);
       addExportInstForBuiltInOutput(m_layer, BuiltInLayer, insertPos);
     }
@@ -1469,14 +1500,8 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
         }
 
         if (hasViewportIndexExport) {
-          unsigned loc = InvalidValue;
-          if (m_shaderStage == ShaderStageCopyShader) {
-            assert(inOutUsage.gs.builtInOutLocs.find(BuiltInViewportIndex) != inOutUsage.gs.builtInOutLocs.end());
-            loc = inOutUsage.gs.builtInOutLocs[BuiltInViewportIndex];
-          } else {
-            assert(inOutUsage.builtInOutputLocMap.find(BuiltInViewportIndex) != inOutUsage.builtInOutputLocMap.end());
-            loc = inOutUsage.builtInOutputLocMap[BuiltInViewportIndex];
-          }
+          assert(builtInOutLocs.find(BuiltInViewportIndex) != builtInOutLocs.end());
+          const unsigned loc = builtInOutLocs.find(BuiltInViewportIndex)->second;
 
           Value *viewportIndex = new BitCastInst(m_viewportIndex, Type::getFloatTy(*m_context), "", insertPos);
 
@@ -1491,24 +1516,16 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
           Value *layer = nullptr;
 
           if (nextBuiltInUsage.layer) {
-            if (m_shaderStage == ShaderStageCopyShader) {
-              assert(inOutUsage.gs.builtInOutLocs.find(BuiltInLayer) != inOutUsage.gs.builtInOutLocs.end());
-              loc = inOutUsage.gs.builtInOutLocs[BuiltInLayer];
-            } else {
-              assert(inOutUsage.builtInOutputLocMap.find(BuiltInLayer) != inOutUsage.builtInOutputLocMap.end());
-              loc = inOutUsage.builtInOutputLocMap[BuiltInLayer];
-            }
+            assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
+            loc = builtInOutLocs.find(BuiltInLayer)->second;
+
             layer = new BitCastInst(m_layer, Type::getFloatTy(*m_context), "", insertPos);
           }
 
           if (nextBuiltInUsage.viewIndex) {
-            if (m_shaderStage == ShaderStageCopyShader) {
-              assert(inOutUsage.gs.builtInOutLocs.find(BuiltInViewIndex) != inOutUsage.gs.builtInOutLocs.end());
-              loc = inOutUsage.gs.builtInOutLocs[BuiltInViewIndex];
-            } else {
-              assert(inOutUsage.builtInOutputLocMap.find(BuiltInViewIndex) != inOutUsage.builtInOutputLocMap.end());
-              loc = inOutUsage.builtInOutputLocMap[BuiltInViewIndex];
-            }
+            assert(builtInOutLocs.find(BuiltInViewIndex) != builtInOutLocs.end());
+            loc = builtInOutLocs.find(BuiltInViewIndex)->second;
+
             if (enableMultiView)
               layer = new BitCastInst(m_layer, Type::getFloatTy(*m_context), "", insertPos);
             else
@@ -1571,13 +1588,13 @@ void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing
 // @param vertexIdx : Input array outermost index used for vertex indexing
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchTcsGenericInputImport(Type *inputTy, unsigned location, Value *locOffset,
-                                                          Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                          Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(compIdx && vertexIdx);
 
-  auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, location, locOffset, compIdx, vertexIdx, insertPos);
-  return readValueFromLds(false, inputTy, ldsOffset, insertPos);
+  auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, location, locOffset, compIdx, vertexIdx, builder);
+  return readValueFromLds(false, inputTy, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -1588,13 +1605,13 @@ Value *PatchInOutImportExport::patchTcsGenericInputImport(Type *inputTy, unsigne
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing
 // @param vertexIdx : Input array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchTesGenericInputImport(Type *inputTy, unsigned location, Value *locOffset,
-                                                          Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                          Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(compIdx);
 
-  auto ldsOffset = calcLdsOffsetForTesInput(inputTy, location, locOffset, compIdx, vertexIdx, insertPos);
-  return readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, insertPos);
+  auto ldsOffset = calcLdsOffsetForTesInput(inputTy, location, locOffset, compIdx, vertexIdx, builder);
+  return readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -1604,9 +1621,9 @@ Value *PatchInOutImportExport::patchTesGenericInputImport(Type *inputTy, unsigne
 // @param location : Location of the input
 // @param compIdx : Index used for vector element indexing
 // @param vertexIdx : Input array outermost index used for vertex indexing
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchGsGenericInputImport(Type *inputTy, unsigned location, unsigned compIdx,
-                                                         Value *vertexIdx, Instruction *insertPos) {
+                                                         Value *vertexIdx, BuilderBase &builder) {
   assert(vertexIdx);
 
   const unsigned compCount = inputTy->isVectorTy() ? cast<FixedVectorType>(inputTy)->getNumElements() : 1;
@@ -1622,14 +1639,14 @@ Value *PatchInOutImportExport::patchGsGenericInputImport(Type *inputTy, unsigned
   } else
     assert(bitWidth == 8 || bitWidth == 16 || bitWidth == 32);
 
-  Value *input = loadValueFromEsGsRing(inputTy, location, compIdx, vertexIdx, insertPos);
+  Value *input = loadValueFromEsGsRing(inputTy, location, compIdx, vertexIdx, &*builder.GetInsertPoint());
 
   if (inputTy != origInputTy) {
     // Cast back to original input type
     assert(canBitCast(inputTy, origInputTy));
     assert(inputTy->isVectorTy());
 
-    input = new BitCastInst(input, origInputTy, "", insertPos);
+    input = builder.CreateBitCast(input, origInputTy);
   }
 
   return input;
@@ -1669,6 +1686,7 @@ Value *PatchInOutImportExport::performFsFloatInterpolation(BuilderBase &builder,
 // @param coordI: Value of I coordinate
 // @param coordJ: Value of J coordinate
 // @param primMask: Value to fill into m0 register
+// @param highHalf : Whether it is a high half in a 16-bit attribute
 Value *PatchInOutImportExport::performFsHalfInterpolation(BuilderBase &builder, Value *attr, Value *channel,
                                                           Value *coordI, Value *coordJ, Value *primMask,
                                                           Value *highHalf) {
@@ -1735,20 +1753,27 @@ Value *PatchInOutImportExport::performFsParameterLoad(BuilderBase &builder, Valu
 // @param location : Base location of the input
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing (could be null)
+// @param isPerPrimitive : Whether the input is per-primitive
 // @param auxInterpValue : Auxiliary value of interpolation: for non "custom" interpolation, it is the explicitly
 // calculated I/J; for "custom" interpolation, it is vertex no. (could be null)
 // @param interpMode : Interpolation mode
 // @param interpLoc : Interpolation location
 // @param highHalf : Whether it is a high half in a 16-bit attribute
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned location, Value *locOffset,
-                                                         Value *compIdx, Value *auxInterpValue, unsigned interpMode,
-                                                         unsigned interpLoc, bool highHalf, Instruction *insertPos) {
-  BuilderBase builder(*m_context);
-  builder.SetInsertPoint(insertPos);
-
+                                                         Value *compIdx, bool isPerPrimitive, Value *auxInterpValue,
+                                                         unsigned interpMode, unsigned interpLoc, bool highHalf,
+                                                         BuilderBase &builder) {
   auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment);
   auto &interpInfo = resUsage->inOutUsage.fs.interpInfo;
+
+  // NOTE: For per-primitive input, the specified location is still per-primitive based. To import the input value, we
+  // have to adjust it by adding the total number of per-vertex inputs since per-vertex exports/imports are prior to
+  // per-primitive ones.
+  if (isPerPrimitive) {
+    auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->inOutUsage;
+    location += inOutUsage.inputMapLocCount;
+  }
 
   const unsigned locCount = inputTy->getPrimitiveSizeInBits() / 8 > SizeOfVec4 ? 2 : 1;
   while (interpInfo.size() <= location + locCount - 1)
@@ -1761,6 +1786,7 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
     interpInfoAtLoc.custom = interpMode == InOutInfo::InterpModeCustom;
     interpInfoAtLoc.is16bit = inputTy->getScalarSizeInBits() == 16;
     interpInfoAtLoc.attr0Valid = true;
+    interpInfoAtLoc.isPerPrimitive = isPerPrimitive;
   } else {
     // attr1Valid is false by default and set it true when it is really a high half
     interpInfo[location].attr1Valid = true;
@@ -1774,6 +1800,9 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
         (interpMode == InOutInfo::InterpModeFlat),
         (interpMode == InOutInfo::InterpModeCustom),
         false,
+        false,
+        false,
+        isPerPrimitive,
     };
   }
 
@@ -1789,7 +1818,7 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
       if (interpMode == InOutInfo::InterpModeSmooth) {
         if (interpLoc == InOutInfo::InterpLocCentroid) {
           ij = adjustCentroidIj(getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.centroid),
-                                getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.center), insertPos);
+                                getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.center), builder);
         } else if (interpLoc == InOutInfo::InterpLocSample)
           ij = getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.sample);
         else {
@@ -1800,7 +1829,7 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
         assert(interpMode == InOutInfo::InterpModeNoPersp);
         if (interpLoc == InOutInfo::InterpLocCentroid) {
           ij = adjustCentroidIj(getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.centroid),
-                                getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.center), insertPos);
+                                getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.center), builder);
         } else if (interpLoc == InOutInfo::InterpLocSample)
           ij = getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.sample);
         else {
@@ -1809,8 +1838,8 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
         }
       }
     }
-    coordI = ExtractElementInst::Create(ij, ConstantInt::get(Type::getInt32Ty(*m_context), 0), "", insertPos);
-    coordJ = ExtractElementInst::Create(ij, ConstantInt::get(Type::getInt32Ty(*m_context), 1), "", insertPos);
+    coordI = builder.CreateExtractElement(ij, uint64_t(0));
+    coordJ = builder.CreateExtractElement(ij, 1);
   }
 
   Type *basicTy = inputTy->isVectorTy() ? cast<VectorType>(inputTy)->getElementType() : inputTy;
@@ -1839,10 +1868,10 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
 
   Value *loc = nullptr;
   if (locOffset) {
-    loc = ConstantInt::get(Type::getInt32Ty(*m_context), location + cast<ConstantInt>(locOffset)->getZExtValue());
+    loc = builder.getInt32(location + cast<ConstantInt>(locOffset)->getZExtValue());
     assert((startChannel + numChannels) <= 4);
   } else {
-    loc = ConstantInt::get(Type::getInt32Ty(*m_context), location);
+    loc = builder.getInt32(location);
   }
 
   for (unsigned i = startChannel; i < startChannel + numChannels; ++i) {
@@ -1891,10 +1920,8 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
 
     if (numChannels == 1)
       interp = compValue;
-    else {
-      interp = InsertElementInst::Create(
-          interp, compValue, ConstantInt::get(Type::getInt32Ty(*m_context), i - startChannel), "", insertPos);
-    }
+    else
+      interp = builder.CreateInsertElement(interp, compValue, i - startChannel);
   }
 
   // Store interpolation results to inputs
@@ -1903,7 +1930,7 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
     input = interp;
   } else {
     assert(canBitCast(interpTy, inputTy));
-    input = new BitCastInst(interp, inputTy, "", insertPos);
+    input = builder.CreateBitCast(interp, inputTy);
   }
 
   return input;
@@ -1917,13 +1944,12 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing
 // @param vertexIdx : Input array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchTcsGenericOutputImport(Type *outputTy, unsigned location, Value *locOffset,
-                                                           Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                           Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(compIdx);
-
-  auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, location, locOffset, compIdx, vertexIdx, insertPos);
-  return readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, insertPos);
+  auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, location, locOffset, compIdx, vertexIdx, builder);
+  return readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -1932,14 +1958,14 @@ Value *PatchInOutImportExport::patchTcsGenericOutputImport(Type *outputTy, unsig
 // @param output : Output value
 // @param location : Location of the output
 // @param compIdx : Index used for vector element indexing
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 void PatchInOutImportExport::patchVsGenericOutputExport(Value *output, unsigned location, unsigned compIdx,
-                                                        Instruction *insertPos) {
+                                                        BuilderBase &builder) {
   auto outputTy = output->getType();
 
   if (m_hasTs) {
-    auto ldsOffset = calcLdsOffsetForVsOutput(outputTy, location, compIdx, insertPos);
-    writeValueToLds(false, output, ldsOffset, insertPos);
+    auto ldsOffset = calcLdsOffsetForVsOutput(outputTy, location, compIdx, builder);
+    writeValueToLds(false, output, ldsOffset, builder);
   } else {
     if (m_hasGs) {
       assert(outputTy->isIntOrIntVectorTy() || outputTy->isFPOrFPVectorTy());
@@ -1952,13 +1978,13 @@ void PatchInOutImportExport::patchVsGenericOutputExport(Value *output, unsigned 
         unsigned compCount = outputTy->isVectorTy() ? cast<FixedVectorType>(outputTy)->getNumElements() * 2 : 2;
 
         outputTy = FixedVectorType::get(Type::getFloatTy(*m_context), compCount);
-        output = new BitCastInst(output, outputTy, "", insertPos);
+        output = builder.CreateBitCast(output, outputTy);
       } else
         assert(bitWidth == 8 || bitWidth == 16 || bitWidth == 32);
 
-      storeValueToEsGsRing(output, location, compIdx, insertPos);
+      storeValueToEsGsRing(output, location, compIdx, &*builder.GetInsertPoint());
     } else
-      addExportInstForGenericOutput(output, location, compIdx, insertPos);
+      addExportInstForGenericOutput(output, location, compIdx, &*builder.GetInsertPoint());
   }
 }
 
@@ -1970,14 +1996,13 @@ void PatchInOutImportExport::patchVsGenericOutputExport(Value *output, unsigned 
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing
 // @param vertexIdx : Input array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 void PatchInOutImportExport::patchTcsGenericOutputExport(Value *output, unsigned location, Value *locOffset,
-                                                         Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                         Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(compIdx);
-
   Type *outputTy = output->getType();
-  auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, location, locOffset, compIdx, vertexIdx, insertPos);
-  writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, insertPos);
+  auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, location, locOffset, compIdx, vertexIdx, builder);
+  writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
 }
 
 // =====================================================================================================================
@@ -1986,9 +2011,9 @@ void PatchInOutImportExport::patchTcsGenericOutputExport(Value *output, unsigned
 // @param output : Output value
 // @param location : Location of the output
 // @param compIdx : Index used for vector element indexing
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 void PatchInOutImportExport::patchTesGenericOutputExport(Value *output, unsigned location, unsigned compIdx,
-                                                         Instruction *insertPos) {
+                                                         BuilderBase &builder) {
   if (m_hasGs) {
     auto outputTy = output->getType();
     assert(outputTy->isIntOrIntVectorTy() || outputTy->isFPOrFPVectorTy());
@@ -2001,13 +2026,13 @@ void PatchInOutImportExport::patchTesGenericOutputExport(Value *output, unsigned
       unsigned compCount = outputTy->isVectorTy() ? cast<FixedVectorType>(outputTy)->getNumElements() * 2 : 2;
       outputTy = FixedVectorType::get(Type::getFloatTy(*m_context), compCount);
 
-      output = new BitCastInst(output, outputTy, "", insertPos);
+      output = builder.CreateBitCast(output, outputTy);
     } else
       assert(bitWidth == 8 || bitWidth == 16 || bitWidth == 32);
 
-    storeValueToEsGsRing(output, location, compIdx, insertPos);
+    storeValueToEsGsRing(output, location, compIdx, &*builder.GetInsertPoint());
   } else
-    addExportInstForGenericOutput(output, location, compIdx, insertPos);
+    addExportInstForGenericOutput(output, location, compIdx, &*builder.GetInsertPoint());
 }
 
 // =====================================================================================================================
@@ -2017,9 +2042,9 @@ void PatchInOutImportExport::patchTesGenericOutputExport(Value *output, unsigned
 // @param location : Location of the output
 // @param compIdx : Index used for vector element indexing
 // @param streamId : ID of output vertex stream
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 void PatchInOutImportExport::patchGsGenericOutputExport(Value *output, unsigned location, unsigned compIdx,
-                                                        unsigned streamId, Instruction *insertPos) {
+                                                        unsigned streamId, BuilderBase &builder) {
   auto outputTy = output->getType();
 
   // Cast double or double vector to float vector.
@@ -2034,7 +2059,7 @@ void PatchInOutImportExport::patchGsGenericOutputExport(Value *output, unsigned 
     else
       outputTy = FixedVectorType::get(Type::getFloatTy(*m_context), 2);
 
-    output = new BitCastInst(output, outputTy, "", insertPos);
+    output = builder.CreateBitCast(output, outputTy);
   } else
     assert(bitWidth == 8 || bitWidth == 16 || bitWidth == 32);
 
@@ -2043,7 +2068,36 @@ void PatchInOutImportExport::patchGsGenericOutputExport(Value *output, unsigned 
 
   assert(compIdx <= 4);
 
-  storeValueToGsVsRing(output, location, compIdx, streamId, insertPos);
+  storeValueToGsVsRing(output, location, compIdx, streamId, &*builder.GetInsertPoint());
+}
+
+// =====================================================================================================================
+// Patches export calls for generic outputs of mesh shader.
+//
+// @param output : Output value
+// @param location : Base location of the output
+// @param locOffset : Relative location offset
+// @param compIdx : Index used for vector element indexing
+// @param vertexOrPrimitiveIdx : Input array outermost index used for vertex or primitive indexing
+// @param isPerPrimitive : Whether the output is per-primitive
+// @param builder : The IR builder to create and insert IR instruction
+void PatchInOutImportExport::patchMeshGenericOutputExport(Value *output, unsigned location, Value *locOffset,
+                                                          Value *compIdx, Value *vertexOrPrimitiveIdx,
+                                                          bool isPerPrimitive, BuilderBase &builder) {
+  // outputOffset = (location + locOffset) * 4 + compIdx * (bitWidth == 64 ? 2 : 1)
+  Value *outputOffset = builder.CreateAdd(builder.getInt32(location), locOffset);
+  outputOffset = builder.CreateShl(outputOffset, 2);
+
+  auto outputTy = output->getType();
+  if (outputTy->getScalarSizeInBits() == 64) {
+    compIdx = builder.CreateShl(compIdx, 1);
+  }
+
+  outputOffset = builder.CreateAdd(outputOffset, compIdx);
+
+  std::string callName(isPerPrimitive ? lgcName::MeshTaskWritePrimitiveOutput : lgcName::MeshTaskWriteVertexOutput);
+  callName += getTypeName(outputTy);
+  builder.CreateNamedCall(callName, builder.getVoidTy(), {outputOffset, vertexOrPrimitiveIdx, output}, {});
 }
 
 // =====================================================================================================================
@@ -2051,8 +2105,8 @@ void PatchInOutImportExport::patchGsGenericOutputExport(Value *output, unsigned 
 //
 // @param inputTy : Type of input value
 // @param builtInId : ID of the built-in variable
-// @param insertPos : Where to insert the patch instruction
-Value *PatchInOutImportExport::patchVsBuiltInInputImport(Type *inputTy, unsigned builtInId, Instruction *insertPos) {
+// @param builder : The IR builder to create and insert IR instruction
+Value *PatchInOutImportExport::patchVsBuiltInInputImport(Type *inputTy, unsigned builtInId, BuilderBase &builder) {
   auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageVertex)->entryArgIdxs.vs;
 
   switch (builtInId) {
@@ -2062,7 +2116,7 @@ Value *PatchInOutImportExport::patchVsBuiltInInputImport(Type *inputTy, unsigned
     if (m_pipelineState->getInputAssemblyState().enableMultiView) {
       return getFunctionArgument(m_entryPoint, entryArgIdxs.viewIndex);
     }
-    return ConstantInt::get(Type::getInt32Ty(*m_context), 0);
+    return builder.getInt32(0);
   }
   default:
     llvm_unreachable("Should never be called!");
@@ -2077,40 +2131,40 @@ Value *PatchInOutImportExport::patchVsBuiltInInputImport(Type *inputTy, unsigned
 // @param builtInId : ID of the built-in variable
 // @param elemIdx : Index used for array/vector element indexing (could be null)
 // @param vertexIdx : Input array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchTcsBuiltInInputImport(Type *inputTy, unsigned builtInId, Value *elemIdx,
-                                                          Value *vertexIdx, Instruction *insertPos) {
+                                                          Value *vertexIdx, BuilderBase &builder) {
   Value *input = UndefValue::get(inputTy);
 
   auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageTessControl)->entryArgIdxs.tcs;
   auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
-  auto &inoutUsage = resUsage->inOutUsage;
-  auto &builtInInLocMap = inoutUsage.builtInInputLocMap;
+  const auto &inoutUsage = resUsage->inOutUsage;
+  const auto &builtInInLocMap = inoutUsage.builtInInputLocMap;
 
   switch (builtInId) {
   case BuiltInPosition: {
     assert(builtInInLocMap.find(builtInId) != builtInInLocMap.end());
-    const unsigned loc = builtInInLocMap[builtInId];
+    const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
-    auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-    input = readValueFromLds(false, inputTy, ldsOffset, insertPos);
+    auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+    input = readValueFromLds(false, inputTy, ldsOffset, builder);
 
     break;
   }
   case BuiltInPointSize: {
     assert(!elemIdx);
     assert(builtInInLocMap.find(builtInId) != builtInInLocMap.end());
-    const unsigned loc = builtInInLocMap[builtInId];
+    const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
-    auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, loc, nullptr, nullptr, vertexIdx, insertPos);
-    input = readValueFromLds(false, inputTy, ldsOffset, insertPos);
+    auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, loc, nullptr, nullptr, vertexIdx, builder);
+    input = readValueFromLds(false, inputTy, ldsOffset, builder);
 
     break;
   }
   case BuiltInClipDistance:
   case BuiltInCullDistance: {
     assert(builtInInLocMap.find(builtInId) != builtInInLocMap.end());
-    const unsigned loc = builtInInLocMap[builtInId];
+    const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
     if (!elemIdx) {
       // gl_ClipDistanceIn[]/gl_CullDistanceIn[] is treated as 2 x vec4
@@ -2119,13 +2173,13 @@ Value *PatchInOutImportExport::patchTcsBuiltInInputImport(Type *inputTy, unsigne
       auto elemTy = inputTy->getArrayElementType();
       for (unsigned i = 0; i < inputTy->getArrayNumElements(); ++i) {
         auto elemIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
-        auto ldsOffset = calcLdsOffsetForTcsInput(elemTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-        auto elem = readValueFromLds(false, elemTy, ldsOffset, insertPos);
-        input = InsertValueInst::Create(input, elem, {i}, "", insertPos);
+        auto ldsOffset = calcLdsOffsetForTcsInput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
+        auto elem = readValueFromLds(false, elemTy, ldsOffset, builder);
+        builder.CreateInsertValue(input, elem, {i});
       }
     } else {
-      auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-      input = readValueFromLds(false, inputTy, ldsOffset, insertPos);
+      auto ldsOffset = calcLdsOffsetForTcsInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+      input = readValueFromLds(false, inputTy, ldsOffset, builder);
     }
 
     break;
@@ -2162,42 +2216,42 @@ Value *PatchInOutImportExport::patchTcsBuiltInInputImport(Type *inputTy, unsigne
 // @param builtInId : ID of the built-in variable
 // @param elemIdx : Index used for array/vector element indexing (could be null)
 // @param vertexIdx : Input array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigned builtInId, Value *elemIdx,
-                                                          Value *vertexIdx, Instruction *insertPos) {
+                                                          Value *vertexIdx, BuilderBase &builder) {
   Value *input = UndefValue::get(inputTy);
 
   auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageTessEval)->entryArgIdxs.tes;
 
   auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval);
-  auto &inOutUsage = resUsage->inOutUsage;
-  auto &builtInInLocMap = inOutUsage.builtInInputLocMap;
-  auto &perPatchBuiltInInLocMap = inOutUsage.perPatchBuiltInInputLocMap;
+  const auto &inOutUsage = resUsage->inOutUsage;
+  const auto &builtInInLocMap = inOutUsage.builtInInputLocMap;
+  const auto &perPatchBuiltInInLocMap = inOutUsage.perPatchBuiltInInputLocMap;
 
   switch (builtInId) {
   case BuiltInPosition: {
     assert(builtInInLocMap.find(builtInId) != builtInInLocMap.end());
-    const unsigned loc = builtInInLocMap[builtInId];
+    const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
-    auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-    input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, insertPos);
+    auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+    input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
 
     break;
   }
   case BuiltInPointSize: {
     assert(!elemIdx);
     assert(builtInInLocMap.find(builtInId) != builtInInLocMap.end());
-    const unsigned loc = builtInInLocMap[builtInId];
+    const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
-    auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, nullptr, vertexIdx, insertPos);
-    input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, insertPos);
+    auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, nullptr, vertexIdx, builder);
+    input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
 
     break;
   }
   case BuiltInClipDistance:
   case BuiltInCullDistance: {
     assert(builtInInLocMap.find(builtInId) != builtInInLocMap.end());
-    const unsigned loc = builtInInLocMap[builtInId];
+    const unsigned loc = builtInInLocMap.find(builtInId)->second;
 
     if (!elemIdx) {
       // gl_ClipDistanceIn[]/gl_CullDistanceIn[] is treated as 2 x vec4
@@ -2205,14 +2259,14 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
 
       auto elemTy = inputTy->getArrayElementType();
       for (unsigned i = 0; i < inputTy->getArrayNumElements(); ++i) {
-        auto elemIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
-        auto ldsOffset = calcLdsOffsetForTesInput(elemTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, insertPos);
-        input = InsertValueInst::Create(input, elem, {i}, "", insertPos);
+        auto elemIdx = builder.getInt32(i);
+        auto ldsOffset = calcLdsOffsetForTesInput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
+        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, builder);
+        input = builder.CreateInsertValue(input, elem, {i});
       }
     } else {
-      auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-      input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, insertPos);
+      auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+      input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
     }
 
     break;
@@ -2223,7 +2277,7 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
     if (hasTcs)
       patchVertices = m_pipelineState->getShaderModes()->getTessellationMode().outputVertices;
 
-    input = ConstantInt::get(Type::getInt32Ty(*m_context), patchVertices);
+    input = builder.getInt32(patchVertices);
 
     break;
   }
@@ -2235,7 +2289,7 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
     auto tessCoord = m_pipelineSysValues.get(m_entryPoint)->getTessCoord();
 
     if (elemIdx)
-      input = ExtractElementInst::Create(tessCoord, elemIdx, "", insertPos);
+      input = builder.CreateExtractElement(tessCoord, elemIdx);
     else
       input = tessCoord;
 
@@ -2244,7 +2298,7 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
   case BuiltInTessLevelOuter:
   case BuiltInTessLevelInner: {
     assert(perPatchBuiltInInLocMap.find(builtInId) != perPatchBuiltInInLocMap.end());
-    unsigned loc = perPatchBuiltInInLocMap[builtInId];
+    unsigned loc = perPatchBuiltInInLocMap.find(builtInId)->second;
 
     if (!elemIdx) {
       // gl_TessLevelOuter[4] is treated as vec4
@@ -2253,14 +2307,14 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
 
       auto elemTy = inputTy->getArrayElementType();
       for (unsigned i = 0; i < inputTy->getArrayNumElements(); ++i) {
-        auto elemIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
-        auto ldsOffset = calcLdsOffsetForTesInput(elemTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, insertPos);
-        input = InsertValueInst::Create(input, elem, {i}, "", insertPos);
+        auto elemIdx = builder.getInt32(i);
+        auto ldsOffset = calcLdsOffsetForTesInput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
+        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, builder);
+        input = builder.CreateInsertValue(input, elem, {i});
       }
     } else {
-      auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-      input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, insertPos);
+      auto ldsOffset = calcLdsOffsetForTesInput(inputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+      input = readValueFromLds(m_pipelineState->isTessOffChip(), inputTy, ldsOffset, builder);
     }
 
     break;
@@ -2284,23 +2338,23 @@ Value *PatchInOutImportExport::patchTesBuiltInInputImport(Type *inputTy, unsigne
 // @param inputTy : Type of input value
 // @param builtInId : ID of the built-in variable
 // @param vertexIdx : Input array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchGsBuiltInInputImport(Type *inputTy, unsigned builtInId, Value *vertexIdx,
-                                                         Instruction *insertPos) {
+                                                         BuilderBase &builder) {
   Value *input = nullptr;
 
   auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageGeometry)->entryArgIdxs.gs;
-  auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage;
-
-  unsigned loc = inOutUsage.builtInInputLocMap[builtInId];
-  assert(loc != InvalidValue);
+  const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage;
 
   switch (builtInId) {
   case BuiltInPosition:
   case BuiltInPointSize:
   case BuiltInClipDistance:
   case BuiltInCullDistance: {
-    input = loadValueFromEsGsRing(inputTy, loc, 0, vertexIdx, insertPos);
+    assert(inOutUsage.builtInInputLocMap.find(builtInId) != inOutUsage.builtInInputLocMap.end());
+    const unsigned loc = inOutUsage.builtInInputLocMap.find(builtInId)->second;
+    assert(loc != InvalidValue);
+    input = loadValueFromEsGsRing(inputTy, loc, 0, vertexIdx, &*builder.GetInsertPoint());
     break;
   }
   case BuiltInPrimitiveId: {
@@ -2330,24 +2384,94 @@ Value *PatchInOutImportExport::patchGsBuiltInInputImport(Type *inputTy, unsigned
 }
 
 // =====================================================================================================================
+// Patches import calls for built-in inputs of mesh shader.
+//
+// @param inputTy : Type of input value
+// @param builtInId : ID of the built-in variable
+// @param elemIdx : Index used for vector element indexing (could be null)
+// @param builder : The IR builder to create and insert IR instruction
+Value *PatchInOutImportExport::patchMeshBuiltInInputImport(Type *inputTy, unsigned builtInId, Value *elemIdx,
+                                                           BuilderBase &builder) {
+  // Handle work group size built-in
+  if (builtInId == BuiltInWorkgroupSize) {
+    // WorkgroupSize is a constant vector supplied by mesh shader mode.
+    const auto &meshMode = m_pipelineState->getShaderModes()->getMeshShaderMode();
+    Value *input =
+        ConstantVector::get({builder.getInt32(meshMode.workgroupSizeX), builder.getInt32(meshMode.workgroupSizeY),
+                             builder.getInt32(meshMode.workgroupSizeZ)});
+    if (elemIdx)
+      input = builder.CreateExtractElement(input, elemIdx);
+    return input;
+  }
+
+  // Handle other built-ins
+  const auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageMesh)->builtInUsage.mesh;
+  (void(builtInUsage)); // Unused
+
+  switch (builtInId) {
+  case BuiltInDrawIndex:
+    assert(builtInUsage.drawIndex);
+    assert(!elemIdx); // No vector element indexing
+    break;
+  case BuiltInViewIndex:
+    assert(builtInUsage.viewIndex);
+    assert(!elemIdx); // No vector element indexing
+    break;
+  case BuiltInNumWorkgroups:
+    assert(builtInUsage.numWorkgroups);
+    inputTy = elemIdx ? FixedVectorType::get(builder.getInt32Ty(), 3) : inputTy;
+    break;
+  case BuiltInWorkgroupId:
+    assert(builtInUsage.workgroupId);
+    inputTy = elemIdx ? FixedVectorType::get(builder.getInt32Ty(), 3) : inputTy;
+    break;
+  case BuiltInLocalInvocationId:
+    assert(builtInUsage.localInvocationId);
+    inputTy = elemIdx ? FixedVectorType::get(builder.getInt32Ty(), 3) : inputTy;
+    break;
+  case BuiltInGlobalInvocationId:
+    assert(builtInUsage.globalInvocationId);
+    inputTy = elemIdx ? FixedVectorType::get(builder.getInt32Ty(), 3) : inputTy;
+    break;
+  case BuiltInLocalInvocationIndex:
+    assert(builtInUsage.localInvocationIndex);
+    assert(!elemIdx); // No vector element indexing
+    break;
+  case BuiltInSubgroupId:
+    assert(builtInUsage.subgroupId);
+    assert(!elemIdx); // No vector element indexing
+    break;
+  case BuiltInNumSubgroups:
+    assert(builtInUsage.numSubgroups);
+    assert(!elemIdx); // No vector element indexing
+    break;
+  default:
+    llvm_unreachable("Unknown mesh shader built-in!");
+    break;
+  }
+
+  std::string callName(lgcName::MeshTaskGetMeshInput);
+  callName += getTypeName(inputTy);
+  Value *input = builder.CreateNamedCall(callName, inputTy, builder.getInt32(builtInId), {});
+  if (elemIdx)
+    input = builder.CreateExtractElement(input, elemIdx);
+  return input;
+}
+
+// =====================================================================================================================
 // Patches import calls for built-in inputs of fragment shader.
 //
 // @param inputTy : Type of input value
 // @param builtInId : ID of the built-in variable
 // @param generalVal : Sample ID, only needed for BuiltInSamplePosOffset; InterpLoc, only needed for BuiltInBaryCoord
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned builtInId, Value *generalVal,
-                                                         Instruction *insertPos) {
+                                                         BuilderBase &builder) {
   Value *input = UndefValue::get(inputTy);
 
-  auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageFragment)->entryArgIdxs.fs;
-  auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
+  const auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageFragment)->entryArgIdxs.fs;
+  const auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
   auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->inOutUsage;
-
-  Attribute::AttrKind attribs[] = {Attribute::ReadNone};
-
-  BuilderBase builder(*m_context);
-  builder.SetInsertPoint(insertPos);
 
   switch (builtInId) {
   case BuiltInSampleMask: {
@@ -2357,20 +2481,18 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     auto ancillary = getFunctionArgument(m_entryPoint, entryArgIdxs.ancillary);
 
     // gl_SampleID = Ancillary[11:8]
-    Value *args[] = {ancillary, ConstantInt::get(Type::getInt32Ty(*m_context), 8),
-                     ConstantInt::get(Type::getInt32Ty(*m_context), 4)};
-    auto sampleId = emitCall("llvm.amdgcn.ubfe.i32", Type::getInt32Ty(*m_context), args, {}, insertPos);
+    auto sampleId = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, builder.getInt32Ty(),
+                                            {ancillary, builder.getInt32(8), builder.getInt32(4)});
 
     Value *sampleMaskIn = sampleCoverage;
     if (m_pipelineState->getRasterizerState().perSampleShading) {
       // gl_SampleMaskIn[0] = (SampleCoverage & (1 << gl_SampleID))
-      sampleMaskIn =
-          BinaryOperator::CreateShl(ConstantInt::get(Type::getInt32Ty(*m_context), 1), sampleId, "", insertPos);
-      sampleMaskIn = BinaryOperator::CreateAnd(sampleCoverage, sampleMaskIn, "", insertPos);
+      sampleMaskIn = builder.CreateShl(builder.getInt32(1), sampleId);
+      sampleMaskIn = builder.CreateAnd(sampleCoverage, sampleMaskIn);
     }
 
     // NOTE: Only gl_SampleMaskIn[0] is valid for us.
-    input = InsertValueInst::Create(input, sampleMaskIn, {0}, "", insertPos);
+    input = builder.CreateInsertValue(input, sampleMaskIn, 0);
 
     break;
   }
@@ -2412,41 +2534,33 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
       fragCoord[2] = adjustedFragCoordZ;
     }
 
-    fragCoord[3] = emitCall("llvm.amdgcn.rcp.f32", Type::getFloatTy(*m_context), {fragCoord[3]}, attribs, insertPos);
+    fragCoord[3] = builder.CreateUnaryIntrinsic(Intrinsic::amdgcn_rcp, fragCoord[3]);
 
     for (unsigned i = 0; i < 4; ++i) {
-      input = InsertElementInst::Create(input, fragCoord[i], ConstantInt::get(Type::getInt32Ty(*m_context), i), "",
-                                        insertPos);
+      input = builder.CreateInsertElement(input, fragCoord[i], i);
     }
 
     break;
   }
   case BuiltInFrontFacing: {
     auto frontFacing = getFunctionArgument(m_entryPoint, entryArgIdxs.frontFacing);
-    input = new ICmpInst(insertPos, ICmpInst::ICMP_NE, frontFacing, ConstantInt::get(Type::getInt32Ty(*m_context), 0));
-    input = CastInst::CreateIntegerCast(input, inputTy, false, "", insertPos);
+    input = builder.CreateICmpNE(frontFacing, builder.getInt32(0));
     break;
   }
   case BuiltInPointCoord: {
     assert(inOutUsage.builtInInputLocMap.find(BuiltInPointCoord) != inOutUsage.builtInInputLocMap.end());
     const unsigned loc = inOutUsage.builtInInputLocMap[BuiltInPointCoord];
 
-    auto &interpInfo = inOutUsage.fs.interpInfo;
-    while (interpInfo.size() <= loc)
-      interpInfo.push_back(InvalidFsInterpInfo);
-    interpInfo[loc] = {loc, false, false, false};
-
     // Emulation for "in vec2 gl_PointCoord"
     const bool perSampleShading = m_pipelineState->getRasterizerState().perSampleShading;
-    input = patchFsGenericInputImport(inputTy, loc, nullptr, nullptr, nullptr, InOutInfo::InterpModeSmooth,
+    input = patchFsGenericInputImport(inputTy, loc, nullptr, nullptr, false, nullptr, InOutInfo::InterpModeSmooth,
                                       perSampleShading ? InOutInfo::InterpLocSample : InOutInfo::InterpLocCenter, false,
-                                      insertPos);
+                                      builder);
     break;
   }
   case BuiltInHelperInvocation: {
-    input = emitCall("llvm.amdgcn.ps.live", Type::getInt1Ty(*m_context), {}, Attribute::ReadNone, insertPos);
-    input = BinaryOperator::CreateNot(input, "", insertPos);
-    input = CastInst::CreateIntegerCast(input, inputTy, false, "", insertPos);
+    input = builder.CreateIntrinsic(Intrinsic::amdgcn_ps_live, {}, {});
+    input = builder.CreateNot(input);
     break;
   }
   case BuiltInPrimitiveId:
@@ -2454,32 +2568,23 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
   case BuiltInViewportIndex:
   case BuiltInViewIndex: {
     unsigned loc = InvalidValue;
+    const auto prevStage = m_pipelineState->getPrevShaderStage(ShaderStageFragment);
 
-    if (builtInId == BuiltInPrimitiveId) {
-      assert(inOutUsage.builtInInputLocMap.find(BuiltInPrimitiveId) != inOutUsage.builtInInputLocMap.end());
-      loc = inOutUsage.builtInInputLocMap[BuiltInPrimitiveId];
-    } else if (builtInId == BuiltInLayer) {
-      assert(inOutUsage.builtInInputLocMap.find(BuiltInLayer) != inOutUsage.builtInInputLocMap.end());
-      loc = inOutUsage.builtInInputLocMap[BuiltInLayer];
-    } else if (builtInId == BuiltInViewIndex) {
-      assert(inOutUsage.builtInInputLocMap.find(BuiltInViewIndex) != inOutUsage.builtInInputLocMap.end());
-      loc = inOutUsage.builtInInputLocMap[BuiltInViewIndex];
+    bool isPerPrimitive = false;
+    if (prevStage == ShaderStageMesh) {
+      assert(inOutUsage.perPrimitiveBuiltInInputLocMap.count(builtInId) > 0);
+      loc = inOutUsage.perPrimitiveBuiltInInputLocMap[builtInId];
+      // NOTE: If the previous shader stage is mesh shader, those built-ins are exported via primitive attributes.
+      isPerPrimitive = true;
     } else {
-      assert(builtInId == BuiltInViewportIndex);
-
-      assert(inOutUsage.builtInInputLocMap.find(BuiltInViewportIndex) != inOutUsage.builtInInputLocMap.end());
-      loc = inOutUsage.builtInInputLocMap[BuiltInViewportIndex];
+      assert(inOutUsage.builtInInputLocMap.count(builtInId) > 0);
+      loc = inOutUsage.builtInInputLocMap[builtInId];
     }
 
-    auto &interpInfo = inOutUsage.fs.interpInfo;
-    while (interpInfo.size() <= loc)
-      interpInfo.push_back(InvalidFsInterpInfo);
-    interpInfo[loc] = {loc, true, false}; // Flat interpolation
-
     // Emulation for "in int gl_PrimitiveID" or "in int gl_Layer" or "in int gl_ViewportIndex"
-    // or "in int gl_ViewIndex"
-    input = patchFsGenericInputImport(inputTy, loc, nullptr, nullptr, nullptr, InOutInfo::InterpModeFlat,
-                                      InOutInfo::InterpLocCenter, false, insertPos);
+    // or "in int gl_ViewIndex".
+    input = patchFsGenericInputImport(inputTy, loc, nullptr, nullptr, isPerPrimitive, nullptr,
+                                      InOutInfo::InterpModeFlat, InOutInfo::InterpLocCenter, false, builder);
     break;
   }
   case BuiltInClipDistance:
@@ -2516,9 +2621,9 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     auto primMask = getFunctionArgument(m_entryPoint, entryArgIdxs.primMask);
     Value *ij = getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.center);
 
-    ij = new BitCastInst(ij, FixedVectorType::get(Type::getFloatTy(*m_context), 2), "", insertPos);
-    auto coordI = ExtractElementInst::Create(ij, ConstantInt::get(Type::getInt32Ty(*m_context), 0), "", insertPos);
-    auto coordJ = ExtractElementInst::Create(ij, ConstantInt::get(Type::getInt32Ty(*m_context), 1), "", insertPos);
+    ij = builder.CreateBitCast(ij, FixedVectorType::get(builder.getFloatTy(), 2));
+    auto coordI = builder.CreateExtractElement(ij, static_cast<uint64_t>(0));
+    auto coordJ = builder.CreateExtractElement(ij, 1);
 
     const unsigned elemCount = inputTy->getArrayNumElements();
     assert(elemCount <= MaxClipCullDistanceCount);
@@ -2527,7 +2632,7 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
       auto compValue = performFsFloatInterpolation(builder, builder.getInt32(loc + (startChannel + i) / 4) /* attr */,
                                                    builder.getInt32((startChannel + i) % 4) /* attr_chan */, coordI,
                                                    coordJ, primMask);
-      input = InsertValueInst::Create(input, compValue, {i}, "", insertPos);
+      input = builder.CreateInsertValue(input, compValue, i);
     }
 
     break;
@@ -2536,9 +2641,8 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     auto ancillary = getFunctionArgument(m_entryPoint, entryArgIdxs.ancillary);
 
     // gl_SampleID = Ancillary[11:8]
-    Value *args[] = {ancillary, ConstantInt::get(Type::getInt32Ty(*m_context), 8),
-                     ConstantInt::get(Type::getInt32Ty(*m_context), 4)};
-    input = emitCall("llvm.amdgcn.ubfe.i32", inputTy, args, {}, insertPos);
+    input = builder.CreateIntrinsic(Intrinsic::amdgcn_ubfe, builder.getInt32Ty(),
+                                    {ancillary, builder.getInt32(8), builder.getInt32(4)});
 
     break;
   }
@@ -2546,7 +2650,7 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     // gl_ShadingRate is not supported on pre-GFX10.3
     assert(m_gfxIp >= GfxIpVersion({10, 3}));
 
-    input = getShadingRate(insertPos);
+    input = getShadingRate(&*builder.GetInsertPoint());
     break;
   }
   // Handle internal-use built-ins for sample position emulation
@@ -2554,7 +2658,7 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     if (m_pipelineState->isUnlinked()) {
       input = builder.CreateRelocationConstant(reloc::NumSamples);
     } else {
-      input = ConstantInt::get(Type::getInt32Ty(*m_context), m_pipelineState->getRasterizerState().numSamples);
+      input = builder.getInt32(m_pipelineState->getRasterizerState().numSamples);
     }
     break;
   }
@@ -2562,7 +2666,7 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
     if (m_pipelineState->isUnlinked()) {
       input = builder.CreateRelocationConstant(reloc::SamplePatternIdx);
     } else {
-      input = ConstantInt::get(Type::getInt32Ty(*m_context), m_pipelineState->getRasterizerState().samplePatternIdx);
+      input = builder.getInt32(m_pipelineState->getRasterizerState().samplePatternIdx);
     }
     break;
   }
@@ -2583,7 +2687,7 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
   case BuiltInBaryCoordSmoothCentroid: {
     assert(entryArgIdxs.perspInterp.centroid != 0);
     input = adjustCentroidIj(getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.centroid),
-                             getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.center), insertPos);
+                             getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.center), builder);
     break;
   }
   case BuiltInInterpPullMode:
@@ -2608,156 +2712,15 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
   case BuiltInBaryCoordNoPerspCentroid: {
     assert(entryArgIdxs.linearInterp.centroid != 0);
     input = adjustCentroidIj(getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.centroid),
-                             getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.center), insertPos);
+                             getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.center), builder);
     break;
   }
   case BuiltInSamplePosOffset: {
-    input = getSamplePosOffset(inputTy, generalVal, insertPos);
+    input = getSamplePosOffset(inputTy, generalVal, builder);
     break;
   }
   case BuiltInSamplePosition: {
-    input = getSamplePosition(inputTy, insertPos);
-    break;
-  }
-  case BuiltInBaryCoord:
-  case BuiltInBaryCoordNoPerspKHR: {
-    assert(isa<ConstantInt>(generalVal));
-    unsigned idx = 0;
-    unsigned interpLoc = cast<ConstantInt>(generalVal)->getZExtValue();
-    Value *iJCoord = nullptr;
-    if (interpLoc == InOutInfo::InterpLocCentroid) {
-      if (BuiltInBaryCoord == builtInId)
-        iJCoord = adjustCentroidIj(getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.centroid),
-                                   getFunctionArgument(m_entryPoint, entryArgIdxs.perspInterp.center), insertPos);
-      else
-        iJCoord = adjustCentroidIj(getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.centroid),
-                                   getFunctionArgument(m_entryPoint, entryArgIdxs.linearInterp.center), insertPos);
-    } else if (interpLoc == InOutInfo::InterpLocSample) {
-      idx = (BuiltInBaryCoord == builtInId) ? entryArgIdxs.perspInterp.sample : entryArgIdxs.linearInterp.sample;
-      iJCoord = getFunctionArgument(m_entryPoint, idx);
-    } else {
-      idx = (BuiltInBaryCoord == builtInId) ? entryArgIdxs.perspInterp.center : entryArgIdxs.linearInterp.center;
-      iJCoord = getFunctionArgument(m_entryPoint, idx);
-    }
-
-    builder.SetInsertPoint(insertPos);
-    auto iCoord = builder.CreateExtractElement(iJCoord, uint64_t(0));
-    auto jCoord = builder.CreateExtractElement(iJCoord, 1);
-    auto primType = m_pipelineState->getPrimitiveType();
-    auto provokingVertexMode = m_pipelineState->getRasterizerState().provokingVertexMode;
-    switch (primType) {
-    case PrimitiveType::Point: {
-      // Points
-      input = builder.CreateInsertElement(input, ConstantFP::get(builder.getFloatTy(), 1.0), uint64_t(0));
-      input = builder.CreateInsertElement(input, ConstantFP::get(builder.getFloatTy(), 0.0), 1);
-      input = builder.CreateInsertElement(input, ConstantFP::get(builder.getFloatTy(), 0.0), 2);
-      break;
-    }
-    case PrimitiveType::LineList:
-    case PrimitiveType::LineStrip: {
-      // Lines
-      // The weight of vertex0 is (1 - i - j), the weight of vertex1 is (i + j).
-      auto kCoord = builder.CreateFSub(ConstantFP::get(builder.getFloatTy(), 1.0), iCoord);
-      kCoord = builder.CreateFSub(kCoord, jCoord);
-      jCoord = builder.CreateFAdd(iCoord, jCoord);
-      input = builder.CreateInsertElement(input, kCoord, uint64_t(0));
-      input = builder.CreateInsertElement(input, jCoord, 1);
-      input = builder.CreateInsertElement(input, ConstantFP::get(builder.getFloatTy(), 0.0), 2);
-      break;
-    }
-    case PrimitiveType::TriangleList: {
-      // Triangles
-      // V0 ==> Attr_indx2
-      // V1 ==> Attr_indx0
-      // V2 ==> Attr_indx1
-      auto kCoord = builder.CreateFSub(ConstantFP::get(builder.getFloatTy(), 1.0), iCoord);
-      kCoord = builder.CreateFSub(kCoord, jCoord);
-      input = builder.CreateInsertElement(input, iCoord, 2);
-      input = builder.CreateInsertElement(input, jCoord, uint64_t(0));
-      input = builder.CreateInsertElement(input, kCoord, 1);
-      break;
-    }
-    case PrimitiveType::TriangleFan: {
-      Value *odd = UndefValue::get(inputTy);
-      Value *even = UndefValue::get(inputTy);
-      auto kCoord = builder.CreateFSub(ConstantFP::get(builder.getFloatTy(), 1.0), iCoord);
-      kCoord = builder.CreateFSub(kCoord, jCoord);
-      if (provokingVertexMode == ProvokingVertexLast) {
-        odd = builder.CreateInsertElement(odd, iCoord, uint64_t(0));
-        odd = builder.CreateInsertElement(odd, jCoord, 1);
-        odd = builder.CreateInsertElement(odd, kCoord, 2);
-
-        even = builder.CreateInsertElement(even, iCoord, 2);
-        even = builder.CreateInsertElement(even, jCoord, uint64_t(0));
-        even = builder.CreateInsertElement(even, kCoord, 1);
-      } else {
-        odd = builder.CreateInsertElement(odd, iCoord, 2);
-        odd = builder.CreateInsertElement(odd, jCoord, uint64_t(0));
-        odd = builder.CreateInsertElement(odd, kCoord, 1);
-
-        even = builder.CreateInsertElement(even, iCoord, 1);
-        even = builder.CreateInsertElement(even, jCoord, 2);
-        even = builder.CreateInsertElement(even, kCoord, uint64_t(0));
-      }
-      auto primitiveId = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInPrimitiveId, nullptr, insertPos);
-      auto evenV = builder.CreateSRem(primitiveId, builder.getInt32(2));
-      Value *con = builder.CreateICmpEQ(evenV, builder.getInt32(0));
-      input = builder.CreateSelect(con, even, odd);
-      break;
-    }
-    case PrimitiveType::TriangleStrip:
-    case PrimitiveType::TriangleStripAdjacency: {
-      Value *odd = UndefValue::get(inputTy);
-      Value *even = UndefValue::get(inputTy);
-      auto kCoord = builder.CreateFSub(ConstantFP::get(builder.getFloatTy(), 1.0), iCoord);
-      kCoord = builder.CreateFSub(kCoord, jCoord);
-      if (provokingVertexMode == ProvokingVertexLast) {
-        odd = builder.CreateInsertElement(odd, iCoord, uint64_t(0));
-        odd = builder.CreateInsertElement(odd, jCoord, 1);
-        odd = builder.CreateInsertElement(odd, kCoord, 2);
-
-        even = builder.CreateInsertElement(even, iCoord, 1);
-        even = builder.CreateInsertElement(even, jCoord, 2);
-        even = builder.CreateInsertElement(even, kCoord, uint64_t(0));
-      } else {
-        odd = builder.CreateInsertElement(odd, iCoord, 2);
-        odd = builder.CreateInsertElement(odd, jCoord, uint64_t(0));
-        odd = builder.CreateInsertElement(odd, kCoord, 1);
-
-        even = builder.CreateInsertElement(even, iCoord, 1);
-        even = builder.CreateInsertElement(even, jCoord, 2);
-        even = builder.CreateInsertElement(even, kCoord, uint64_t(0));
-      }
-      auto primitiveId = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInPrimitiveId, nullptr, insertPos);
-      auto evenV = builder.CreateSRem(primitiveId, builder.getInt32(2));
-      Value *con = builder.CreateICmpEQ(evenV, builder.getInt32(0));
-      input = builder.CreateSelect(con, even, odd);
-      break;
-    }
-    case PrimitiveType::TriangleListAdjacency: {
-      auto kCoord = builder.CreateFSub(ConstantFP::get(builder.getFloatTy(), 1.0), iCoord);
-      kCoord = builder.CreateFSub(kCoord, jCoord);
-      Value *odd = UndefValue::get(inputTy);
-      odd = builder.CreateInsertElement(odd, iCoord, uint64_t(0));
-      odd = builder.CreateInsertElement(odd, jCoord, 1);
-      odd = builder.CreateInsertElement(odd, kCoord, 2);
-
-      Value *even = UndefValue::get(inputTy);
-      even = builder.CreateInsertElement(even, iCoord, 1);
-      even = builder.CreateInsertElement(even, jCoord, 2);
-      even = builder.CreateInsertElement(even, kCoord, uint64_t(0));
-
-      auto primitiveId = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInPrimitiveId, nullptr, insertPos);
-      auto evenV = builder.CreateSRem(primitiveId, builder.getInt32(2));
-      Value *con = builder.CreateICmpEQ(evenV, builder.getInt32(0));
-      input = builder.CreateSelect(con, even, odd);
-      break;
-    }
-    default: {
-      llvm_unreachable("Should never be called!");
-      break;
-    }
-    }
+    input = getSamplePosition(inputTy, builder);
     break;
   }
   default: {
@@ -2774,13 +2737,11 @@ Value *PatchInOutImportExport::patchFsBuiltInInputImport(Type *inputTy, unsigned
 //
 // @param inputTy : Type of BuiltInSamplePosOffset
 // @param sampleId : Sample ID
-// @param insertPos : Insert position
-Value *PatchInOutImportExport::getSamplePosOffset(Type *inputTy, Value *sampleId, Instruction *insertPos) {
+// @param builder : The IR builder to create and insert IR instruction
+Value *PatchInOutImportExport::getSamplePosOffset(Type *inputTy, Value *sampleId, BuilderBase &builder) {
   // Gets the offset of sample position relative to the pixel center for the specified sample ID
-  BuilderBase builder(*m_context);
-  builder.SetInsertPoint(insertPos);
-  Value *numSamples = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInNumSamples, nullptr, insertPos);
-  Value *patternIdx = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInSamplePatternIdx, nullptr, insertPos);
+  Value *numSamples = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInNumSamples, nullptr, builder);
+  Value *patternIdx = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInSamplePatternIdx, nullptr, builder);
   Value *validOffset = builder.CreateAdd(patternIdx, sampleId);
   // offset = (sampleCount > sampleId) ? (samplePatternOffset + sampleId) : 0
   Value *sampleValid = builder.CreateICmpUGT(numSamples, sampleId);
@@ -2797,12 +2758,10 @@ Value *PatchInOutImportExport::getSamplePosOffset(Type *inputTy, Value *sampleId
 // Generate code to read BuiltInSamplePosition
 //
 // @param inputTy : Type of BuiltInSamplePosition
-// @param insertPos : Insert position
-Value *PatchInOutImportExport::getSamplePosition(Type *inputTy, Instruction *insertPos) {
-  IRBuilder<> builder(*m_context);
-  builder.SetInsertPoint(insertPos);
-  Value *sampleId = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInSampleId, nullptr, insertPos);
-  Value *input = patchFsBuiltInInputImport(inputTy, BuiltInSamplePosOffset, sampleId, insertPos);
+// @param builder : The IR builder to create and insert IR instruction
+Value *PatchInOutImportExport::getSamplePosition(Type *inputTy, BuilderBase &builder) {
+  Value *sampleId = patchFsBuiltInInputImport(builder.getInt32Ty(), BuiltInSampleId, nullptr, builder);
+  Value *input = patchFsBuiltInInputImport(inputTy, BuiltInSamplePosOffset, sampleId, builder);
   return builder.CreateFAdd(input, ConstantFP::get(inputTy, 0.5));
 }
 
@@ -2813,38 +2772,27 @@ Value *PatchInOutImportExport::getSamplePosition(Type *inputTy, Instruction *ins
 // @param builtInId : ID of the built-in variable
 // @param elemIdx : Index used for array/vector element indexing (could be null)
 // @param vertexIdx : Output array outermost index used for vertex indexing (could be null)
-// @param insertPos : Where to insert the patch instruction
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::patchTcsBuiltInOutputImport(Type *outputTy, unsigned builtInId, Value *elemIdx,
-                                                           Value *vertexIdx, Instruction *insertPos) {
+                                                           Value *vertexIdx, BuilderBase &builder) {
   Value *output = UndefValue::get(outputTy);
 
-  auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
-  auto &builtInUsage = resUsage->builtInUsage.tcs;
-  auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+  const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
+  const auto &builtInUsage = resUsage->builtInUsage.tcs;
+  const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
 
   switch (builtInId) {
-  case BuiltInPosition: {
-    assert(builtInUsage.position);
-    (void(builtInUsage)); // unused
-
-    assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-    unsigned loc = builtInOutLocMap[builtInId];
-
-    auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-    output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, insertPos);
-
-    break;
-  }
+  case BuiltInPosition:
   case BuiltInPointSize: {
-    assert(builtInUsage.pointSize);
+    assert(builtInId != BuiltInPosition || builtInUsage.position);
+    assert(builtInId != BuiltInPointSize || (builtInUsage.pointSize && !elemIdx));
     (void(builtInUsage)); // unused
 
-    assert(!elemIdx);
     assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-    unsigned loc = builtInOutLocMap[builtInId];
+    unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
-    auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, nullptr, vertexIdx, insertPos);
-    output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, insertPos);
+    auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+    output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, builder);
 
     break;
   }
@@ -2860,7 +2808,7 @@ Value *PatchInOutImportExport::patchTcsBuiltInOutputImport(Type *outputTy, unsig
     }
 
     assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-    unsigned loc = builtInOutLocMap[builtInId];
+    unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
     if (!elemIdx) {
       // gl_ClipDistance[]/gl_CullDistance[] is treated as 2 x vec4
@@ -2868,79 +2816,47 @@ Value *PatchInOutImportExport::patchTcsBuiltInOutputImport(Type *outputTy, unsig
 
       auto elemTy = outputTy->getArrayElementType();
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
-        auto elemIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
-        auto ldsOffset = calcLdsOffsetForTcsOutput(elemTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, insertPos);
-        output = InsertValueInst::Create(output, elem, {i}, "", insertPos);
+        auto elemIdx = builder.getInt32(i);
+        auto ldsOffset = calcLdsOffsetForTcsOutput(elemTy, loc, nullptr, elemIdx, vertexIdx, builder);
+        auto elem = readValueFromLds(m_pipelineState->isTessOffChip(), elemTy, ldsOffset, builder);
+        output = builder.CreateInsertValue(output, elem, {i});
       }
     } else {
-      auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-      output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, insertPos);
+      auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+      output = readValueFromLds(m_pipelineState->isTessOffChip(), outputTy, ldsOffset, builder);
     }
 
     break;
   }
-  case BuiltInTessLevelOuter: {
-    assert(builtInUsage.tessLevelOuter);
+  case BuiltInTessLevelOuter:
+  case BuiltInTessLevelInner: {
+    assert(builtInId != BuiltInTessLevelOuter || builtInUsage.tessLevelOuter);
+    assert(builtInId != BuiltInTessLevelInner || builtInUsage.tessLevelInner);
     (void(builtInUsage)); // Unused
 
-    auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
-    auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
+    const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
 
     // tessLevelOuter (float[4]) + tessLevelInner (float[2])
     // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch + elemIdx
-    if (outputTy->isArrayTy()) {
-      // Import the whole tessLevelOuter array
-      for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
-        Value *ldsOffset = BinaryOperator::CreateMul(
-            relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-        ldsOffset = BinaryOperator::CreateAdd(
-            ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart + i), ldsOffset, "",
-            insertPos);
-        auto elem = readValueFromLds(false, Type::getFloatTy(*m_context), ldsOffset, insertPos);
-        output = InsertValueInst::Create(output, elem, {i}, "", insertPos);
-      }
-    } else {
-      // Import a single element of tessLevelOuter array
-      Value *ldsOffset = BinaryOperator::CreateMul(
-          relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(
-          ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart), "", insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(ldsOffset, elemIdx, "", insertPos);
-      output = readValueFromLds(false, outputTy, ldsOffset, insertPos);
-    }
+    uint32_t tessFactorStart = calcFactor.onChip.tessFactorStart;
+    if (builtInId == BuiltInTessLevelInner)
+      tessFactorStart += 4;
 
-    break;
-  }
-  case BuiltInTessLevelInner: {
-    assert(builtInUsage.tessLevelInner);
-    (void(builtInUsage)); // Unused
-
-    auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
     auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
+    Value *baseOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
 
-    // tessLevelOuter (float[4]) + tessLevelInner (float[2])
-    // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch + 4 + elemIdx
     if (outputTy->isArrayTy()) {
-      // Import the whole tessLevelInner array
+      // Import the whole tessLevel array
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
-        Value *ldsOffset = BinaryOperator::CreateMul(
-            relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-        ldsOffset = BinaryOperator::CreateAdd(
-            ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart + 4 + i), ldsOffset, "",
-            insertPos);
-        auto elem = readValueFromLds(false, Type::getFloatTy(*m_context), ldsOffset, insertPos);
-        output = InsertValueInst::Create(output, elem, {i}, "", insertPos);
+        Value *ldsOffset = builder.CreateAdd(baseOffset, builder.getInt32(tessFactorStart + i));
+        auto elem = readValueFromLds(false, Type::getFloatTy(*m_context), ldsOffset, builder);
+        output = builder.CreateInsertValue(output, elem, {i});
       }
     } else {
-      // Import a single element of tessLevelInner array
-      Value *ldsOffset = BinaryOperator::CreateMul(
-          relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(
-          ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart + 4), "",
-          insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(ldsOffset, elemIdx, "", insertPos);
-      output = readValueFromLds(false, outputTy, ldsOffset, insertPos);
+      // Import a single element of tessLevel array
+      Value *ldsOffset = builder.CreateAdd(baseOffset, builder.getInt32(tessFactorStart));
+      ldsOffset = builder.CreateAdd(ldsOffset, elemIdx);
+      output = readValueFromLds(false, outputTy, ldsOffset, builder);
     }
 
     break;
@@ -2961,38 +2877,22 @@ Value *PatchInOutImportExport::patchTcsBuiltInOutputImport(Type *outputTy, unsig
 // @param builtInId : ID of the built-in variable
 // @param insertPos : Where to insert the patch instruction
 void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned builtInId, Instruction *insertPos) {
+  BuilderBase builder(insertPos);
+
   auto outputTy = output->getType();
 
-  auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex);
+  const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex);
   auto &builtInUsage = resUsage->builtInUsage.vs;
-  auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+  const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
 
   switch (builtInId) {
-  case BuiltInPosition: {
-    if (!static_cast<bool>(builtInUsage.position))
-      return;
-
-    if (m_hasTs) {
-      unsigned loc = builtInOutLocMap[builtInId];
-      auto ldsOffset = calcLdsOffsetForVsOutput(outputTy, loc, 0, insertPos);
-      writeValueToLds(false, output, ldsOffset, insertPos);
-    } else {
-      if (m_hasGs) {
-        assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-        unsigned loc = builtInOutLocMap[builtInId];
-
-        storeValueToEsGsRing(output, loc, 0, insertPos);
-      } else
-        addExportInstForBuiltInOutput(output, builtInId, insertPos);
-    }
-
-    break;
-  }
+  case BuiltInPosition:
   case BuiltInPointSize: {
-    if (!static_cast<bool>(builtInUsage.pointSize))
+    if ((builtInId == BuiltInPosition && !builtInUsage.position) ||
+        (builtInId == BuiltInPointSize && !builtInUsage.pointSize))
       return;
 
-    if (isa<UndefValue>(output)) {
+    if (builtInId == BuiltInPointSize && isa<UndefValue>(output)) {
       // NOTE: gl_PointSize is always declared as a field of gl_PerVertex. We have to check the output
       // value to determine if it is actually referenced in shader.
       builtInUsage.pointSize = false;
@@ -3000,13 +2900,14 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
     }
 
     if (m_hasTs) {
-      unsigned loc = builtInOutLocMap[builtInId];
-      auto ldsOffset = calcLdsOffsetForVsOutput(outputTy, loc, 0, insertPos);
-      writeValueToLds(false, output, ldsOffset, insertPos);
+      assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
+      unsigned loc = builtInOutLocMap.find(builtInId)->second;
+      auto ldsOffset = calcLdsOffsetForVsOutput(outputTy, loc, 0, builder);
+      writeValueToLds(false, output, ldsOffset, builder);
     } else {
       if (m_hasGs) {
         assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-        unsigned loc = builtInOutLocMap[builtInId];
+        unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
         storeValueToEsGsRing(output, loc, 0, insertPos);
       } else
@@ -3015,64 +2916,32 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
 
     break;
   }
-  case BuiltInClipDistance: {
-    if (builtInUsage.clipDistance == 0)
-      return;
-
-    if (isa<UndefValue>(output)) {
-      // NOTE: gl_ClipDistance[] is always declared as a field of gl_PerVertex. We have to check the output
-      // value to determine if it is actually referenced in shader.
-      builtInUsage.clipDistance = 0;
-      return;
-    }
-
-    if (m_hasTs) {
-      assert(outputTy->isArrayTy());
-
-      unsigned loc = builtInOutLocMap[builtInId];
-      auto ldsOffset = calcLdsOffsetForVsOutput(outputTy->getArrayElementType(), loc, 0, insertPos);
-
-      for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
-        auto elem = ExtractValueInst::Create(output, {i}, "", insertPos);
-        writeValueToLds(false, elem, ldsOffset, insertPos);
-
-        ldsOffset =
-            BinaryOperator::CreateAdd(ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 1), "", insertPos);
-      }
-    } else {
-      if (m_hasGs) {
-        assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-        unsigned loc = builtInOutLocMap[builtInId];
-
-        storeValueToEsGsRing(output, loc, 0, insertPos);
-      } else {
-        // NOTE: The export of gl_ClipDistance[] is delayed and is done before entry-point returns.
-        m_clipDistance = output;
-      }
-    }
-
-    break;
-  }
+  case BuiltInClipDistance:
   case BuiltInCullDistance: {
-    if (builtInUsage.cullDistance == 0)
+    if ((builtInId == BuiltInClipDistance && builtInUsage.clipDistance == 0) ||
+        (builtInId == BuiltInCullDistance && builtInUsage.cullDistance == 0))
       return;
 
     if (isa<UndefValue>(output)) {
-      // NOTE: gl_CullDistance[] is always declared as a field of gl_PerVertex. We have to check the output
+      // NOTE: gl_{Clip,Cull}Distance[] is always declared as a field of gl_PerVertex. We have to check the output
       // value to determine if it is actually referenced in shader.
-      builtInUsage.cullDistance = 0;
+      if (builtInId == BuiltInClipDistance)
+        builtInUsage.clipDistance = 0;
+      else
+        builtInUsage.cullDistance = 0;
       return;
     }
 
     if (m_hasTs) {
       assert(outputTy->isArrayTy());
 
-      unsigned loc = builtInOutLocMap[builtInId];
-      auto ldsOffset = calcLdsOffsetForVsOutput(outputTy->getArrayElementType(), loc, 0, insertPos);
+      assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
+      unsigned loc = builtInOutLocMap.find(builtInId)->second;
+      auto ldsOffset = calcLdsOffsetForVsOutput(outputTy->getArrayElementType(), loc, 0, builder);
 
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
         auto elem = ExtractValueInst::Create(output, {i}, "", insertPos);
-        writeValueToLds(false, elem, ldsOffset, insertPos);
+        writeValueToLds(false, elem, ldsOffset, builder);
 
         ldsOffset =
             BinaryOperator::CreateAdd(ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 1), "", insertPos);
@@ -3080,12 +2949,15 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
     } else {
       if (m_hasGs) {
         assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-        unsigned loc = builtInOutLocMap[builtInId];
+        unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
         storeValueToEsGsRing(output, loc, 0, insertPos);
       } else {
-        // NOTE: The export of gl_CullDistance[] is delayed and is done before entry-point returns.
-        m_cullDistance = output;
+        // NOTE: The export of gl_{Clip,Cull}Distance[] is delayed and is done before entry-point returns.
+        if (builtInId == BuiltInClipDistance)
+          m_clipDistance = output;
+        else
+          m_cullDistance = output;
       }
     }
 
@@ -3094,18 +2966,7 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
   case BuiltInLayer: {
     if (!static_cast<bool>(builtInUsage.layer))
       return;
-
-    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
-
-    // NOTE: Only last non-fragment shader stage has to export the value of gl_Layer.
-    if (!m_hasTs && !m_hasGs && !static_cast<bool>(enableMultiView)) {
-      if (m_gfxIp.major <= 8)
-        addExportInstForBuiltInOutput(output, builtInId, insertPos);
-      else {
-        // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
-        m_layer = output;
-      }
-    }
+    m_layer = output;
 
     break;
   }
@@ -3155,35 +3016,28 @@ void PatchInOutImportExport::patchVsBuiltInOutputExport(Value *output, unsigned 
 // @param insertPos : Where to insert the patch instruction
 void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned builtInId, Value *elemIdx,
                                                          Value *vertexIdx, Instruction *insertPos) {
+  BuilderBase builder(insertPos);
+
   auto outputTy = output->getType();
 
-  auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
-  auto &builtInUsage = resUsage->builtInUsage.tcs;
-  auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+  const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
+  const auto &builtInUsage = resUsage->builtInUsage.tcs;
+  const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
 
   switch (builtInId) {
-  case BuiltInPosition: {
-    if (!static_cast<bool>(builtInUsage.position))
-      return;
-
-    assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-    unsigned loc = builtInOutLocMap[builtInId];
-
-    auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-    writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, insertPos);
-
-    break;
-  }
+  case BuiltInPosition:
   case BuiltInPointSize: {
-    if (!static_cast<bool>(builtInUsage.pointSize))
+    if ((builtInId == BuiltInPosition && !builtInUsage.position) ||
+        (builtInId == BuiltInPointSize && !builtInUsage.pointSize))
       return;
 
-    assert(!elemIdx);
-    assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-    unsigned loc = builtInOutLocMap[builtInId];
+    assert(builtInId != BuiltInPointSize || !elemIdx);
 
-    auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, nullptr, vertexIdx, insertPos);
-    writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, insertPos);
+    assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
+    unsigned loc = builtInOutLocMap.find(builtInId)->second;
+
+    auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+    writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
 
     break;
   }
@@ -3194,7 +3048,7 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
       return;
 
     assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-    unsigned loc = builtInOutLocMap[builtInId];
+    unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
     if (!elemIdx) {
       // gl_ClipDistance[]/gl_CullDistance[] is treated as 2 x vec4
@@ -3203,71 +3057,40 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
         auto elem = ExtractValueInst::Create(output, {i}, "", insertPos);
         auto elemIdx = ConstantInt::get(Type::getInt32Ty(*m_context), i);
-        auto ldsOffset = calcLdsOffsetForTcsOutput(elem->getType(), loc, nullptr, elemIdx, vertexIdx, insertPos);
-        writeValueToLds(m_pipelineState->isTessOffChip(), elem, ldsOffset, insertPos);
+        auto ldsOffset = calcLdsOffsetForTcsOutput(elem->getType(), loc, nullptr, elemIdx, vertexIdx, builder);
+        writeValueToLds(m_pipelineState->isTessOffChip(), elem, ldsOffset, builder);
       }
     } else {
-      auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, insertPos);
-      writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, insertPos);
+      auto ldsOffset = calcLdsOffsetForTcsOutput(outputTy, loc, nullptr, elemIdx, vertexIdx, builder);
+      writeValueToLds(m_pipelineState->isTessOffChip(), output, ldsOffset, builder);
     }
 
     break;
   }
-  case BuiltInTessLevelOuter: {
-    auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
+  case BuiltInTessLevelOuter:
+  case BuiltInTessLevelInner: {
+    const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
     auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
 
     // tessLevelOuter (float[4]) + tessLevelInner (float[2])
     // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch + elemIdx
+    uint32_t tessFactorStart = calcFactor.onChip.tessFactorStart;
+    if (builtInId == BuiltInTessLevelInner)
+      tessFactorStart += 4;
+
+    Value *baseOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
     if (outputTy->isArrayTy()) {
       // Export the whole tessLevelOuter array
       for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
-        Value *ldsOffset = BinaryOperator::CreateMul(
-            relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-        ldsOffset = BinaryOperator::CreateAdd(
-            ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart + i), ldsOffset, "",
-            insertPos);
-        auto elem = ExtractValueInst::Create(output, {i}, "", insertPos);
-        writeValueToLds(false, elem, ldsOffset, insertPos);
+        Value *ldsOffset = builder.CreateAdd(baseOffset, builder.getInt32(tessFactorStart + i));
+        auto elem = builder.CreateExtractValue(output, {i});
+        writeValueToLds(false, elem, ldsOffset, builder);
       }
     } else {
       // Export a single element of tessLevelOuter array
-      Value *ldsOffset = BinaryOperator::CreateMul(
-          relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(
-          ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart), "", insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(ldsOffset, elemIdx, "", insertPos);
-      writeValueToLds(false, output, ldsOffset, insertPos);
-    }
-
-    break;
-  }
-  case BuiltInTessLevelInner: {
-    auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
-    auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
-
-    // tessLevelOuter (float[4]) + tessLevelInner (float[2])
-    // ldsOffset = tessFactorStart + relativeId * MaxTessFactorsPerPatch + 4 + elemIdx
-    if (outputTy->isArrayTy()) {
-      // Export the whole tessLevelInner array
-      for (unsigned i = 0; i < outputTy->getArrayNumElements(); ++i) {
-        Value *ldsOffset = BinaryOperator::CreateMul(
-            relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-        ldsOffset = BinaryOperator::CreateAdd(
-            ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart + 4 + i), ldsOffset, "",
-            insertPos);
-        auto elem = ExtractValueInst::Create(output, {i}, "", insertPos);
-        writeValueToLds(false, elem, ldsOffset, insertPos);
-      }
-    } else {
-      // Export a single element of tessLevelInner array
-      Value *ldsOffset = BinaryOperator::CreateMul(
-          relativeId, ConstantInt::get(Type::getInt32Ty(*m_context), MaxTessFactorsPerPatch), "", insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(
-          ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.onChip.tessFactorStart + 4), "",
-          insertPos);
-      ldsOffset = BinaryOperator::CreateAdd(ldsOffset, elemIdx, "", insertPos);
-      writeValueToLds(false, output, ldsOffset, insertPos);
+      Value *ldsOffset = builder.CreateAdd(baseOffset, builder.getInt32(tessFactorStart));
+      ldsOffset = builder.CreateAdd(ldsOffset, elemIdx, "", insertPos);
+      writeValueToLds(false, output, ldsOffset, builder);
     }
 
     break;
@@ -3286,88 +3109,62 @@ void PatchInOutImportExport::patchTcsBuiltInOutputExport(Value *output, unsigned
 // @param builtInId : ID of the built-in variable
 // @param insertPos : Where to insert the patch instruction
 void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned builtInId, Instruction *insertPos) {
-  auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval);
+  const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessEval);
   auto &builtInUsage = resUsage->builtInUsage.tes;
-  auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+  const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
 
   switch (builtInId) {
-  case BuiltInPosition: {
-    if (!static_cast<bool>(builtInUsage.position))
-      return;
-
-    if (m_hasGs) {
-      assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-      unsigned loc = builtInOutLocMap[builtInId];
-
-      storeValueToEsGsRing(output, loc, 0, insertPos);
-    } else
-      addExportInstForBuiltInOutput(output, builtInId, insertPos);
-
-    break;
-  }
-  case BuiltInPointSize: {
-    if (!static_cast<bool>(builtInUsage.pointSize))
-      return;
-
-    if (isa<UndefValue>(output)) {
-      // NOTE: gl_PointSize is always declared as a field of gl_PerVertex. We have to check the output
-      // value to determine if it is actually referenced in shader.
-      builtInUsage.pointSize = false;
-      return;
-    }
-
-    if (m_hasGs) {
-      assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-      unsigned loc = builtInOutLocMap[builtInId];
-
-      storeValueToEsGsRing(output, loc, 0, insertPos);
-    } else
-      addExportInstForBuiltInOutput(output, builtInId, insertPos);
-
-    break;
-  }
-  case BuiltInClipDistance: {
-    if (builtInUsage.clipDistance == 0)
-      return;
-
-    if (isa<UndefValue>(output)) {
-      // NOTE: gl_ClipDistance[] is always declared as a field of gl_PerVertex. We have to check the output
-      // value to determine if it is actually referenced in shader.
-      builtInUsage.clipDistance = 0;
-      return;
-    }
-
-    if (m_hasGs) {
-      assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-      unsigned loc = builtInOutLocMap[builtInId];
-
-      storeValueToEsGsRing(output, loc, 0, insertPos);
-    } else {
-      // NOTE: The export of gl_ClipDistance[] is delayed and is done before entry-point returns.
-      m_clipDistance = output;
-    }
-
-    break;
-  }
+  case BuiltInPosition:
+  case BuiltInPointSize:
+  case BuiltInClipDistance:
   case BuiltInCullDistance: {
-    if (builtInUsage.cullDistance == 0)
+    if ((builtInId == BuiltInPosition && !builtInUsage.position) ||
+        (builtInId == BuiltInPointSize && !builtInUsage.pointSize))
       return;
 
     if (isa<UndefValue>(output)) {
-      // NOTE: gl_CullDistance[] is always declared as a field of gl_PerVertex. We have to check the output
+      // NOTE: gl_* builtins are always declared as a field of gl_PerVertex. We have to check the output
       // value to determine if it is actually referenced in shader.
-      builtInUsage.cullDistance = 0;
-      return;
+      switch (builtInId) {
+      case BuiltInPosition:
+        builtInUsage.position = false;
+        return;
+      case BuiltInPointSize:
+        builtInUsage.pointSize = false;
+        return;
+      case BuiltInClipDistance:
+        builtInUsage.clipDistance = 0;
+        return;
+      case BuiltInCullDistance:
+        builtInUsage.cullDistance = 0;
+        return;
+      default:
+        llvm_unreachable("unhandled builtInId");
+      }
     }
 
     if (m_hasGs) {
       assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-      unsigned loc = builtInOutLocMap[builtInId];
+      unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
       storeValueToEsGsRing(output, loc, 0, insertPos);
     } else {
-      // NOTE: The export of gl_CullDistance[] is delayed and is done before entry-point returns.
-      m_cullDistance = output;
+      switch (builtInId) {
+      case BuiltInPosition:
+      case BuiltInPointSize:
+        addExportInstForBuiltInOutput(output, builtInId, insertPos);
+        break;
+      case BuiltInClipDistance:
+        // NOTE: The export of gl_ClipDistance[] is delayed and is done before entry-point returns.
+        m_clipDistance = output;
+        break;
+      case BuiltInCullDistance:
+        // NOTE: The export of gl_CullDistance[] is delayed and is done before entry-point returns.
+        m_cullDistance = output;
+        break;
+      default:
+        llvm_unreachable("unhandled builtInId");
+      }
     }
 
     break;
@@ -3380,12 +3177,8 @@ void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned
 
     // NOTE: Only last non-fragment shader stage has to export the value of gl_Layer.
     if (!m_hasGs && !static_cast<bool>(enableMultiView)) {
-      if (m_gfxIp.major <= 8)
-        addExportInstForBuiltInOutput(output, builtInId, insertPos);
-      else {
-        // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
-        m_layer = output;
-      }
+      // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
+      m_layer = output;
     }
 
     break;
@@ -3422,12 +3215,12 @@ void PatchInOutImportExport::patchTesBuiltInOutputExport(Value *output, unsigned
 // @param insertPos : Where to insert the patch instruction
 void PatchInOutImportExport::patchGsBuiltInOutputExport(Value *output, unsigned builtInId, unsigned streamId,
                                                         Instruction *insertPos) {
-  auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
-  auto &builtInUsage = resUsage->builtInUsage.gs;
-  auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+  const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry);
+  const auto &builtInUsage = resUsage->builtInUsage.gs;
+  const auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
 
   assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
-  unsigned loc = builtInOutLocMap[builtInId];
+  const unsigned loc = builtInOutLocMap.find(builtInId)->second;
 
   switch (builtInId) {
   case BuiltInPosition:
@@ -3461,6 +3254,114 @@ void PatchInOutImportExport::patchGsBuiltInOutputExport(Value *output, unsigned 
 
   (void(builtInUsage)); // unused
   storeValueToGsVsRing(output, loc, 0, streamId, insertPos);
+}
+
+// =====================================================================================================================
+// Patches export calls for built-in outputs of mesh shader.
+//
+// @param output : Output value
+// @param builtInId : ID of the built-in variable
+// @param elemIdx : Index used for array/vector element indexing (could be null)
+// @param vertexOrPrimitiveIdx : Output array outermost index used for vertex or primitive indexing
+// @param isPerPrimitive : Whether the output is per-primitive
+// @param insertPos : Where to insert the patch instruction
+void PatchInOutImportExport::patchMeshBuiltInOutputExport(Value *output, unsigned builtInId, Value *elemIdx,
+                                                          Value *vertexOrPrimitiveIdx, bool isPerPrimitive,
+                                                          Instruction *insertPos) {
+  BuilderBase builder(*m_context);
+  builder.SetInsertPoint(insertPos);
+
+  auto outputTy = output->getType();
+
+  // Handle primitive indices built-ins
+  if (builtInId == BuiltInPrimitivePointIndices || builtInId == BuiltInPrimitiveLineIndices ||
+      builtInId == BuiltInPrimitiveTriangleIndices) {
+    // Output primitive type must match primitive indices built-in
+    auto outputPrimitive = m_pipelineState->getShaderModes()->getMeshShaderMode().outputPrimitive;
+    assert((builtInId == BuiltInPrimitivePointIndices && outputPrimitive == OutputPrimitives::Points) ||
+           (builtInId == BuiltInPrimitiveLineIndices && outputPrimitive == OutputPrimitives::Lines) ||
+           (builtInId == BuiltInPrimitiveTriangleIndices && outputPrimitive == OutputPrimitives::Triangles));
+    (void(outputPrimitive)); // Unused
+
+    // Element indexing is forbidden. This is required by the spec that says "Each array element must be written as a
+    // whole, partial writes to the vector components for line and triangle primitives is not allowed."
+    assert(!elemIdx);
+
+    builder.CreateNamedCall(lgcName::MeshTaskSetPrimitiveIndices + getTypeName(outputTy), builder.getVoidTy(),
+                            {vertexOrPrimitiveIdx, output}, {});
+    return;
+  }
+
+  // Handle cull primitive built-in
+  if (builtInId == BuiltInCullPrimitive) {
+    assert(isPerPrimitive);
+    assert(outputTy->isIntegerTy(1)); // Must be boolean
+    builder.CreateNamedCall(lgcName::MeshTaskSetPrimitiveCulled, builder.getVoidTy(), {vertexOrPrimitiveIdx, output},
+                            {});
+    return;
+  }
+
+  // Handle normal per-vertex or per-primitive built-ins
+  const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageMesh);
+  const auto &builtInUsage = resUsage->builtInUsage.mesh;
+  unsigned loc = InvalidValue;
+
+  if (isPerPrimitive) {
+    switch (builtInId) {
+    case BuiltInPrimitiveId:
+      assert(builtInUsage.primitiveId);
+      break;
+    case BuiltInLayer:
+      assert(builtInUsage.layer);
+      break;
+    case BuiltInViewportIndex:
+      assert(builtInUsage.viewportIndex);
+      break;
+    case BuiltInPrimitiveShadingRate:
+      assert(builtInUsage.primitiveShadingRate);
+      break;
+    default:
+      llvm_unreachable("Should never be called!");
+      break;
+    }
+
+    auto &perPrimitiveBuiltInOutputLocMap = resUsage->inOutUsage.perPrimitiveBuiltInOutputLocMap;
+    assert(perPrimitiveBuiltInOutputLocMap.find(builtInId) != perPrimitiveBuiltInOutputLocMap.end());
+    loc = perPrimitiveBuiltInOutputLocMap[builtInId];
+  } else {
+    switch (builtInId) {
+    case BuiltInPosition:
+      assert(builtInUsage.position);
+      break;
+    case BuiltInPointSize:
+      assert(builtInUsage.pointSize);
+      break;
+    case BuiltInClipDistance:
+      assert(builtInUsage.clipDistance);
+      break;
+    case BuiltInCullDistance:
+      assert(builtInUsage.cullDistance);
+      break;
+    default:
+      llvm_unreachable("Should never be called!");
+      break;
+    }
+
+    auto &builtInOutLocMap = resUsage->inOutUsage.builtInOutputLocMap;
+    assert(builtInOutLocMap.find(builtInId) != builtInOutLocMap.end());
+    loc = builtInOutLocMap[builtInId];
+  }
+
+  (void(builtInUsage)); // Unused
+
+  // outputOffset = location * 4 + elemIdx
+  Value *outputOffset = builder.getInt32(4 * loc);
+  if (elemIdx)
+    outputOffset = builder.CreateAdd(builder.getInt32(4 * loc), elemIdx);
+
+  std::string callName(isPerPrimitive ? lgcName::MeshTaskWritePrimitiveOutput : lgcName::MeshTaskWriteVertexOutput);
+  callName += getTypeName(outputTy);
+  builder.CreateNamedCall(callName, builder.getVoidTy(), {outputOffset, vertexOrPrimitiveIdx, output}, {});
 }
 
 // =====================================================================================================================
@@ -3535,14 +3436,8 @@ void PatchInOutImportExport::patchCopyShaderBuiltInOutputExport(Value *output, u
     break;
   }
   case BuiltInLayer: {
-    const auto enableMultiView = m_pipelineState->getInputAssemblyState().enableMultiView;
-
-    if (m_gfxIp.major <= 8 && !static_cast<bool>(enableMultiView))
-      addExportInstForBuiltInOutput(output, builtInId, insertPos);
-    else {
-      // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
-      m_layer = output;
-    }
+    // NOTE: The export of gl_Layer is delayed and is done before entry-point returns.
+    m_layer = output;
 
     break;
   }
@@ -3798,10 +3693,10 @@ void PatchInOutImportExport::createStreamOutBufferStoreFunction(Value *storeValu
 // @param storeOffset : Buffer store offset
 // @param bufBase : Buffer base offset
 // @param coherent : Buffer coherency
-// @param insertPos : Where to insert write instructions
+// @param builder : The IR builder to create and insert IR instruction
 unsigned PatchInOutImportExport::combineBufferStore(const std::vector<Value *> &storeValues, unsigned startIdx,
                                                     unsigned valueOffset, Value *bufDesc, Value *storeOffset,
-                                                    Value *bufBase, CoherentFlag coherent, Instruction *insertPos) {
+                                                    Value *bufBase, CoherentFlag coherent, BuilderBase &builder) {
   Type *storeTys[4] = {
       Type::getInt32Ty(*m_context),
       FixedVectorType::get(Type::getInt32Ty(*m_context), 2),
@@ -3826,23 +3721,21 @@ unsigned PatchInOutImportExport::combineBufferStore(const std::vector<Value *> &
         storeValue = UndefValue::get(storeTy);
 
         for (unsigned i = 0; i < compCount; ++i) {
-          storeValue = InsertElementInst::Create(storeValue, storeValues[startIdx + i],
-                                                 ConstantInt::get(Type::getInt32Ty(*m_context), i), "", insertPos);
+          storeValue = builder.CreateInsertElement(storeValue, storeValues[startIdx + i], i);
         }
       } else
         storeValue = storeValues[startIdx];
 
-      auto writeOffset = BinaryOperator::CreateAdd(
-          storeOffset, ConstantInt::get(Type::getInt32Ty(*m_context), valueOffset * 4), "", insertPos);
+      auto writeOffset = builder.CreateAdd(storeOffset, builder.getInt32(valueOffset * 4));
       Value *args[] = {
-          storeValue,                                                                      // vdata
-          bufDesc,                                                                         // rsrc
-          writeOffset,                                                                     // voffset
-          bufBase,                                                                         // soffset
-          ConstantInt::get(Type::getInt32Ty(*m_context), (*m_buffFormats)[compCount - 1]), // format
-          ConstantInt::get(Type::getInt32Ty(*m_context), coherent.u32All)                  // glc
+          storeValue,                                        // vdata
+          bufDesc,                                           // rsrc
+          writeOffset,                                       // voffset
+          bufBase,                                           // soffset
+          builder.getInt32((*m_buffFormats)[compCount - 1]), // format
+          builder.getInt32(coherent.u32All)                  // glc
       };
-      emitCall(funcName, Type::getVoidTy(*m_context), args, {}, insertPos);
+      builder.CreateNamedCall(funcName, Type::getVoidTy(*m_context), args, {});
 
       break;
     }
@@ -3860,10 +3753,10 @@ unsigned PatchInOutImportExport::combineBufferStore(const std::vector<Value *> &
 // @param loadOffset : Buffer load offset
 // @param bufBase : Buffer base offset
 // @param coherent : Buffer coherency
-// @param insertPos : Where to insert write instructions
+// @param builder : The IR builder to create and insert IR instruction
 unsigned PatchInOutImportExport::combineBufferLoad(std::vector<Value *> &loadValues, unsigned startIdx, Value *bufDesc,
                                                    Value *loadOffset, Value *bufBase, CoherentFlag coherent,
-                                                   Instruction *insertPos) {
+                                                   BuilderBase &builder) {
   Type *loadTyps[4] = {
       Type::getInt32Ty(*m_context),
       FixedVectorType::get(Type::getInt32Ty(*m_context), 2),
@@ -3885,22 +3778,19 @@ unsigned PatchInOutImportExport::combineBufferLoad(std::vector<Value *> &loadVal
       funcName += getTypeName(loadTyps[compCount - 1]);
 
       Value *loadValue = nullptr;
-      auto writeOffset = BinaryOperator::CreateAdd(
-          loadOffset, ConstantInt::get(Type::getInt32Ty(*m_context), startIdx * 4), "", insertPos);
+      auto writeOffset = builder.CreateAdd(loadOffset, builder.getInt32(startIdx * 4));
       Value *args[] = {
-          bufDesc,                                                                         // rsrc
-          writeOffset,                                                                     // voffset
-          bufBase,                                                                         // soffset
-          ConstantInt::get(Type::getInt32Ty(*m_context), (*m_buffFormats)[compCount - 1]), // format
-          ConstantInt::get(Type::getInt32Ty(*m_context), coherent.u32All)                  // glc
+          bufDesc,                                           // rsrc
+          writeOffset,                                       // voffset
+          bufBase,                                           // soffset
+          builder.getInt32((*m_buffFormats)[compCount - 1]), // format
+          builder.getInt32(coherent.u32All)                  // glc
       };
-      loadValue = emitCall(funcName, loadTyps[compCount - 1], args, {}, insertPos);
+      loadValue = builder.CreateNamedCall(funcName, loadTyps[compCount - 1], args, {});
       assert(loadValue);
       if (compCount > 1) {
-        for (unsigned i = 0; i < compCount; i++) {
-          loadValues[startIdx + i] =
-              ExtractElementInst::Create(loadValue, ConstantInt::get(Type::getInt32Ty(*m_context), i), "", insertPos);
-        }
+        for (unsigned i = 0; i < compCount; i++)
+          loadValues[startIdx + i] = builder.CreateExtractElement(loadValue, i);
       } else
         loadValues[startIdx] = loadValue;
 
@@ -3979,7 +3869,7 @@ void PatchInOutImportExport::storeValueToStreamOutBuffer(Value *storeValue, unsi
     writeIndex = CopyShaderUserSgprIdxWriteIndex;
     streamInfo = CopyShaderUserSgprIdxStreamInfo;
 
-    auto &inoutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage;
+    const auto &inoutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageGeometry)->inOutUsage;
     unsigned streamOffset = CopyShaderUserSgprIdxStreamOffset;
 
     for (unsigned i = 0; i < MaxTransformFeedbackBuffers; ++i) {
@@ -4083,7 +3973,7 @@ void PatchInOutImportExport::storeValueToEsGsRing(Value *storeValue, unsigned lo
       Value *idxs[] = {ConstantInt::get(Type::getInt32Ty(*m_context), 0), ringOffset};
       auto ldsType = m_lds->getValueType();
       Value *storePtr = GetElementPtrInst::Create(ldsType, m_lds, idxs, "", insertPos);
-      new StoreInst(storeValue, storePtr, false, m_lds->getAlign().getValue(), insertPos);
+      new StoreInst(storeValue, storePtr, false, m_lds->getAlign().value(), insertPos);
     } else {
       Value *esGsRingBufDesc = m_pipelineSysValues.get(m_entryPoint)->getEsGsRingBufDesc();
 
@@ -4153,7 +4043,7 @@ Value *PatchInOutImportExport::loadValueFromEsGsRing(Type *loadTy, unsigned loca
       auto ldsType = m_lds->getValueType();
       auto *loadPtr = GetElementPtrInst::Create(ldsType, m_lds, idxs, "", insertPos);
       auto loadInst =
-          new LoadInst(loadPtr->getResultElementType(), loadPtr, "", false, m_lds->getAlign().getValue(), insertPos);
+          new LoadInst(loadPtr->getResultElementType(), loadPtr, "", false, m_lds->getAlign().value(), insertPos);
       loadValue = loadInst;
 
       if (bitWidth == 8)
@@ -4276,7 +4166,7 @@ void PatchInOutImportExport::storeValueToGsVsRing(Value *storeValue, unsigned lo
       Value *idxs[] = {ConstantInt::get(Type::getInt32Ty(*m_context), 0), ringOffset};
       auto ldsType = m_lds->getValueType();
       Value *storePtr = GetElementPtrInst::Create(ldsType, m_lds, idxs, "", insertPos);
-      new StoreInst(storeValue, storePtr, false, m_lds->getAlign().getValue(), insertPos);
+      new StoreInst(storeValue, storePtr, false, m_lds->getAlign().value(), insertPos);
     } else {
       // NOTE: Here we use tbuffer_store instruction instead of buffer_store because we have to do explicit
       // control of soffset. This is required by swizzle enabled mode when address range checking should be
@@ -4460,8 +4350,8 @@ Value *PatchInOutImportExport::calcGsVsRingOffsetForOutput(unsigned location, un
 // @param isOutput : Is the value from output variable
 // @param readTy : Type of value read from LDS
 // @param ldsOffset : Start offset to do LDS read operations
-// @param insertPos : Where to insert read instructions
-Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Value *ldsOffset, Instruction *insertPos) {
+// @param builder : The IR builder to create and insert IR instruction
+Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Value *ldsOffset, BuilderBase &builder) {
   assert(m_lds);
   assert(readTy->isSingleValueType());
 
@@ -4485,7 +4375,7 @@ Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Valu
     auto offChipLdsBase = getFunctionArgument(m_entryPoint, offChipLdsBaseArgIdx);
 
     // Convert dword off-chip LDS offset to byte offset
-    ldsOffset = BinaryOperator::CreateMul(ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 4), "", insertPos);
+    ldsOffset = builder.CreateMul(ldsOffset, builder.getInt32(4));
 
     CoherentFlag coherent = {};
     if (m_gfxIp.major <= 9)
@@ -4497,34 +4387,25 @@ Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Valu
     else
       llvm_unreachable("Not implemented!");
 
-    for (unsigned i = 0, combineCount = 0; i < numChannels; i += combineCount) {
-      combineCount = combineBufferLoad(loadValues, i, offChipLdsDesc, ldsOffset, offChipLdsBase, coherent, insertPos);
-
-      for (unsigned j = i; j < i + combineCount; ++j) {
-        if (bitWidth == 8)
-          loadValues[j] = new TruncInst(loadValues[j], Type::getInt8Ty(*m_context), "", insertPos);
-        else if (bitWidth == 16)
-          loadValues[j] = new TruncInst(loadValues[j], Type::getInt16Ty(*m_context), "", insertPos);
-      }
-    }
+    for (unsigned i = 0, combineCount = 0; i < numChannels; i += combineCount)
+      combineCount = combineBufferLoad(loadValues, i, offChipLdsDesc, ldsOffset, offChipLdsBase, coherent, builder);
   } else {
     // Read from on-chip LDS
     for (unsigned i = 0; i < numChannels; ++i) {
-      Value *idxs[] = {ConstantInt::get(Type::getInt32Ty(*m_context), 0), ldsOffset};
+      Value *idxs[] = {builder.getInt32(0), ldsOffset};
       auto ldsType = m_lds->getValueType();
-      auto *loadPtr = GetElementPtrInst::Create(ldsType, m_lds, idxs, "", insertPos);
-      auto loadTy = loadPtr->getResultElementType();
-      auto loadInst = new LoadInst(loadTy, loadPtr, "", false, m_lds->getAlign().getValue(), insertPos);
-      loadValues[i] = loadInst;
+      auto *loadPtr = builder.CreateGEP(ldsType, m_lds, idxs);
+      auto loadTy = GetElementPtrInst::getIndexedType(ldsType, idxs);
+      loadValues[i] = builder.CreateLoad(loadTy, loadPtr);
 
-      if (bitWidth == 8)
-        loadValues[i] = new TruncInst(loadValues[i], Type::getInt8Ty(*m_context), "", insertPos);
-      else if (bitWidth == 16)
-        loadValues[i] = new TruncInst(loadValues[i], Type::getInt16Ty(*m_context), "", insertPos);
-
-      ldsOffset =
-          BinaryOperator::CreateAdd(ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 1), "", insertPos);
+      ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(1));
     }
+  }
+
+  if (bitWidth == 8 || bitWidth == 16) {
+    Type *ty = bitWidth == 8 ? builder.getInt8Ty() : builder.getInt16Ty();
+    for (unsigned i = 0; i < numChannels; ++i)
+      loadValues[i] = builder.CreateTrunc(loadValues[i], ty);
   }
 
   // Construct <n x i8>, <n x i16>, or <n x i32> vector from load values (dwords)
@@ -4537,14 +4418,13 @@ Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Valu
     castValue = UndefValue::get(castTy);
 
     for (unsigned i = 0; i < numChannels; ++i) {
-      castValue = InsertElementInst::Create(castValue, loadValues[i], ConstantInt::get(Type::getInt32Ty(*m_context), i),
-                                            "", insertPos);
+      castValue = builder.CreateInsertElement(castValue, loadValues[i], i);
     }
   } else
     castValue = loadValues[0];
 
   // Cast <n x i8>, <n x i16> or <n x i32> vector to read value
-  return new BitCastInst(castValue, readTy, "", insertPos);
+  return builder.CreateBitCast(castValue, readTy);
 }
 
 // =====================================================================================================================
@@ -4553,9 +4433,8 @@ Value *PatchInOutImportExport::readValueFromLds(bool offChip, Type *readTy, Valu
 // @param offChip : Whether to use off-chip LDS or not
 // @param writeValue : Value written to LDS
 // @param ldsOffset : Start offset to do LDS write operations
-// @param insertPos : Where to insert write instructions
-void PatchInOutImportExport::writeValueToLds(bool offChip, Value *writeValue, Value *ldsOffset,
-                                             Instruction *insertPos) {
+// @param builder : The IR builder to create and insert IR instruction
+void PatchInOutImportExport::writeValueToLds(bool offChip, Value *writeValue, Value *ldsOffset, BuilderBase &builder) {
   assert(m_lds);
 
   auto writeTy = writeValue->getType();
@@ -4571,23 +4450,20 @@ void PatchInOutImportExport::writeValueToLds(bool offChip, Value *writeValue, Va
                     ? Type::getInt32Ty(*m_context)
                     : (bitWidth == 16 ? Type::getInt16Ty(*m_context) : Type::getInt8Ty(*m_context));
   Type *castTy = numChannels > 1 ? cast<Type>(FixedVectorType::get(intTy, numChannels)) : intTy;
-  Value *castValue = new BitCastInst(writeValue, castTy, "", insertPos);
+  Value *castValue = builder.CreateBitCast(writeValue, castTy);
 
   // Extract store values (dwords) from <n x i8>, <n x i16> or <n x i32> vector
   std::vector<Value *> storeValues(numChannels);
   if (numChannels > 1) {
-    for (unsigned i = 0; i < numChannels; ++i) {
-      storeValues[i] =
-          ExtractElementInst::Create(castValue, ConstantInt::get(Type::getInt32Ty(*m_context), i), "", insertPos);
-
-      if (bitWidth == 8 || bitWidth == 16)
-        storeValues[i] = new ZExtInst(storeValues[i], Type::getInt32Ty(*m_context), "", insertPos);
-    }
+    for (unsigned i = 0; i < numChannels; ++i)
+      storeValues[i] = builder.CreateExtractElement(castValue, i);
   } else {
     storeValues[0] = castValue;
+  }
 
-    if (bitWidth == 8 || bitWidth == 16)
-      storeValues[0] = new ZExtInst(storeValues[0], Type::getInt32Ty(*m_context), "", insertPos);
+  if (bitWidth == 8 || bitWidth == 16) {
+    for (unsigned i = 0; i < numChannels; ++i)
+      storeValues[i] = builder.CreateZExt(storeValues[i], builder.getInt32Ty());
   }
 
   if (offChip) {
@@ -4596,7 +4472,7 @@ void PatchInOutImportExport::writeValueToLds(bool offChip, Value *writeValue, Va
 
     auto offChipLdsBase = getFunctionArgument(m_entryPoint, entryArgIdxs.offChipLdsBase);
     // Convert dword off-chip LDS offset to byte offset
-    ldsOffset = BinaryOperator::CreateMul(ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 4), "", insertPos);
+    ldsOffset = builder.CreateMul(ldsOffset, builder.getInt32(4));
 
     auto offChipLdsDesc = m_pipelineSysValues.get(m_entryPoint)->getOffChipLdsDesc();
 
@@ -4605,18 +4481,17 @@ void PatchInOutImportExport::writeValueToLds(bool offChip, Value *writeValue, Va
 
     for (unsigned i = 0, combineCount = 0; i < numChannels; i += combineCount) {
       combineCount =
-          combineBufferStore(storeValues, i, i, offChipLdsDesc, ldsOffset, offChipLdsBase, coherent, insertPos);
+          combineBufferStore(storeValues, i, i, offChipLdsDesc, ldsOffset, offChipLdsBase, coherent, builder);
     }
   } else {
     // Write to on-chip LDS
     for (unsigned i = 0; i < numChannels; ++i) {
-      Value *idxs[] = {ConstantInt::get(Type::getInt32Ty(*m_context), 0), ldsOffset};
+      Value *idxs[] = {builder.getInt32(0), ldsOffset};
       auto ldsType = m_lds->getValueType();
-      Value *storePtr = GetElementPtrInst::Create(ldsType, m_lds, idxs, "", insertPos);
-      new StoreInst(storeValues[i], storePtr, false, m_lds->getAlign().getValue(), insertPos);
+      Value *storePtr = builder.CreateGEP(ldsType, m_lds, idxs);
+      builder.CreateStore(storeValues[i], storePtr);
 
-      ldsOffset =
-          BinaryOperator::CreateAdd(ldsOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 1), "", insertPos);
+      ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(1));
     }
   }
 }
@@ -4627,13 +4502,13 @@ void PatchInOutImportExport::writeValueToLds(bool offChip, Value *writeValue, Va
 // @param outputTy : Type of the output
 // @param location : Base location of the output
 // @param compIdx : Index used for vector element indexing
-// @param insertPos : Where to insert calculation instructions
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::calcLdsOffsetForVsOutput(Type *outputTy, unsigned location, unsigned compIdx,
-                                                        Instruction *insertPos) {
+                                                        BuilderBase &builder) {
   assert(m_shaderStage == ShaderStageVertex);
 
   // attribOffset = location * 4 + compIdx
-  Value *attribOffset = ConstantInt::get(Type::getInt32Ty(*m_context), location * 4);
+  Value *attribOffset = builder.getInt32(location * 4);
 
   const unsigned bitWidth = outputTy->getScalarSizeInBits();
   assert(bitWidth == 8 || bitWidth == 16 || bitWidth == 32 || bitWidth == 64);
@@ -4643,18 +4518,17 @@ Value *PatchInOutImportExport::calcLdsOffsetForVsOutput(Type *outputTy, unsigned
     compIdx *= 2;
   }
 
-  attribOffset =
-      BinaryOperator::CreateAdd(attribOffset, ConstantInt::get(Type::getInt32Ty(*m_context), compIdx), "", insertPos);
+  attribOffset = builder.CreateAdd(attribOffset, builder.getInt32(compIdx));
 
   const auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageVertex)->entryArgIdxs.vs;
   auto relVertexId = getFunctionArgument(m_entryPoint, entryArgIdxs.relVertexId);
 
   const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
-  auto vertexStride = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.inVertexStride);
+  auto vertexStride = builder.getInt32(calcFactor.inVertexStride);
 
   // dwordOffset = relVertexId * vertexStride + attribOffset
-  auto ldsOffset = BinaryOperator::CreateMul(relVertexId, vertexStride, "", insertPos);
-  ldsOffset = BinaryOperator::CreateAdd(ldsOffset, attribOffset, "", insertPos);
+  auto ldsOffset = builder.CreateMul(relVertexId, vertexStride);
+  ldsOffset = builder.CreateAdd(ldsOffset, attribOffset);
 
   return ldsOffset;
 }
@@ -4667,22 +4541,21 @@ Value *PatchInOutImportExport::calcLdsOffsetForVsOutput(Type *outputTy, unsigned
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing (could be null)
 // @param vertexIdx : Vertex indexing
-// @param insertPos : Where to insert calculation instructions
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::calcLdsOffsetForTcsInput(Type *inputTy, unsigned location, Value *locOffset,
-                                                        Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                        Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(m_shaderStage == ShaderStageTessControl);
 
   const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs;
   const auto &calcFactor = inOutUsage.calcFactor;
 
   // attribOffset = (location + locOffset) * 4 + compIdx
-  Value *attribOffset = ConstantInt::get(Type::getInt32Ty(*m_context), location);
+  Value *attribOffset = builder.getInt32(location);
 
   if (locOffset)
-    attribOffset = BinaryOperator::CreateAdd(attribOffset, locOffset, "", insertPos);
+    attribOffset = builder.CreateAdd(attribOffset, locOffset);
 
-  attribOffset =
-      BinaryOperator::CreateMul(attribOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 4), "", insertPos);
+  attribOffset = builder.CreateMul(attribOffset, builder.getInt32(4));
 
   if (compIdx) {
     const unsigned bitWidth = inputTy->getScalarSizeInBits();
@@ -4690,24 +4563,24 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsInput(Type *inputTy, unsigned 
 
     if (bitWidth == 64) {
       // For 64-bit data type, the component indexing must multiply by 2
-      compIdx = BinaryOperator::CreateMul(compIdx, ConstantInt::get(Type::getInt32Ty(*m_context), 2), "", insertPos);
+      compIdx = builder.CreateMul(compIdx, builder.getInt32(2));
     }
 
-    attribOffset = BinaryOperator::CreateAdd(attribOffset, compIdx, "", insertPos);
+    attribOffset = builder.CreateAdd(attribOffset, compIdx);
   }
 
   // dwordOffset = (relativeId * inVertexCount + vertexId) * inVertexStride + attribOffset
   auto inVertexCount = m_pipelineState->getInputAssemblyState().patchControlPoints;
-  auto inVertexCountVal = ConstantInt::get(Type::getInt32Ty(*m_context), inVertexCount);
+  auto inVertexCountVal = builder.getInt32(inVertexCount);
   auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
 
-  Value *ldsOffset = BinaryOperator::CreateMul(relativeId, inVertexCountVal, "", insertPos);
-  ldsOffset = BinaryOperator::CreateAdd(ldsOffset, vertexIdx, "", insertPos);
+  Value *ldsOffset = builder.CreateMul(relativeId, inVertexCountVal);
+  ldsOffset = builder.CreateAdd(ldsOffset, vertexIdx);
 
-  auto inVertexStride = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.inVertexStride);
-  ldsOffset = BinaryOperator::CreateMul(ldsOffset, inVertexStride, "", insertPos);
+  auto inVertexStride = builder.getInt32(calcFactor.inVertexStride);
+  ldsOffset = builder.CreateMul(ldsOffset, inVertexStride);
 
-  ldsOffset = BinaryOperator::CreateAdd(ldsOffset, attribOffset, "", insertPos);
+  ldsOffset = builder.CreateAdd(ldsOffset, attribOffset);
 
   return ldsOffset;
 }
@@ -4720,9 +4593,9 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsInput(Type *inputTy, unsigned 
 // @param locOffset : Relative location offset (could be null)
 // @param compIdx : Index used for vector element indexing (could be null)
 // @param vertexIdx : Vertex indexing
-// @param insertPos : Where to insert calculation instructions
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::calcLdsOffsetForTcsOutput(Type *outputTy, unsigned location, Value *locOffset,
-                                                         Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                         Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(m_shaderStage == ShaderStageTessControl);
 
   const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs;
@@ -4735,13 +4608,12 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsOutput(Type *outputTy, unsigne
       m_pipelineState->isTessOffChip() ? calcFactor.offChip.patchConstStart : calcFactor.onChip.patchConstStart;
 
   // attribOffset = (location + locOffset) * 4 + compIdx * bitWidth / 32
-  Value *attibOffset = ConstantInt::get(Type::getInt32Ty(*m_context), location);
+  Value *attribOffset = builder.getInt32(location);
 
   if (locOffset)
-    attibOffset = BinaryOperator::CreateAdd(attibOffset, locOffset, "", insertPos);
+    attribOffset = builder.CreateAdd(attribOffset, locOffset);
 
-  attibOffset =
-      BinaryOperator::CreateMul(attibOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 4), "", insertPos);
+  attribOffset = builder.CreateMul(attribOffset, builder.getInt32(4));
 
   if (compIdx) {
     const unsigned bitWidth = outputTy->getScalarSizeInBits();
@@ -4749,10 +4621,10 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsOutput(Type *outputTy, unsigne
 
     if (bitWidth == 64) {
       // For 64-bit data type, the component indexing must multiply by 2
-      compIdx = BinaryOperator::CreateMul(compIdx, ConstantInt::get(Type::getInt32Ty(*m_context), 2), "", insertPos);
+      compIdx = builder.CreateMul(compIdx, builder.getInt32(2));
     }
 
-    attibOffset = BinaryOperator::CreateAdd(attibOffset, compIdx, "", insertPos);
+    attribOffset = builder.CreateAdd(attribOffset, compIdx);
   }
 
   Value *ldsOffset = nullptr;
@@ -4761,27 +4633,26 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsOutput(Type *outputTy, unsigne
   auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
   if (perPatch) {
     // dwordOffset = patchConstStart + relativeId * patchConstSize + attribOffset
-    auto patchConstSize = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.patchConstSize);
-    ldsOffset = BinaryOperator::CreateMul(relativeId, patchConstSize, "", insertPos);
+    auto patchConstSize = builder.getInt32(calcFactor.patchConstSize);
+    ldsOffset = builder.CreateMul(relativeId, patchConstSize);
 
-    auto patchConstStartVal = ConstantInt::get(Type::getInt32Ty(*m_context), patchConstStart);
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, patchConstStartVal, "", insertPos);
+    auto patchConstStartVal = builder.getInt32(patchConstStart);
+    ldsOffset = builder.CreateAdd(ldsOffset, patchConstStartVal);
 
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, attibOffset, "", insertPos);
+    ldsOffset = builder.CreateAdd(ldsOffset, attribOffset);
   } else {
     // dwordOffset = outPatchStart + (relativeId * outVertexCount + vertexId) * outVertexStride + attribOffset
     //             = outPatchStart + relativeId * outPatchSize + vertexId  * outVertexStride + attribOffset
-    auto outPatchSize = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.outPatchSize);
-    ldsOffset = BinaryOperator::CreateMul(relativeId, outPatchSize, "", insertPos);
+    auto outPatchSize = builder.getInt32(calcFactor.outPatchSize);
+    ldsOffset = builder.CreateMul(relativeId, outPatchSize);
 
-    auto outPatchStartVal = ConstantInt::get(Type::getInt32Ty(*m_context), outPatchStart);
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, outPatchStartVal, "", insertPos);
+    auto outPatchStartVal = builder.getInt32(outPatchStart);
+    ldsOffset = builder.CreateAdd(ldsOffset, outPatchStartVal);
 
-    auto outVertexStride = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.outVertexStride);
-    ldsOffset = BinaryOperator::CreateAdd(
-        ldsOffset, BinaryOperator::CreateMul(vertexIdx, outVertexStride, "", insertPos), "", insertPos);
+    auto outVertexStride = builder.getInt32(calcFactor.outVertexStride);
+    ldsOffset = builder.CreateAdd(ldsOffset, builder.CreateMul(vertexIdx, outVertexStride));
 
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, attibOffset, "", insertPos);
+    ldsOffset = builder.CreateAdd(ldsOffset, attribOffset);
   }
 
   return ldsOffset;
@@ -4795,9 +4666,9 @@ Value *PatchInOutImportExport::calcLdsOffsetForTcsOutput(Type *outputTy, unsigne
 // @param locOffset : Relative location offset
 // @param compIdx : Index used for vector element indexing (could be null)
 // @param vertexIdx : Vertex indexing
-// @param insertPos : Where to insert calculation instructions
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::calcLdsOffsetForTesInput(Type *inputTy, unsigned location, Value *locOffset,
-                                                        Value *compIdx, Value *vertexIdx, Instruction *insertPos) {
+                                                        Value *compIdx, Value *vertexIdx, BuilderBase &builder) {
   assert(m_shaderStage == ShaderStageTessEval);
 
   const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
@@ -4813,13 +4684,12 @@ Value *PatchInOutImportExport::calcLdsOffsetForTesInput(Type *inputTy, unsigned 
   auto relPatchId = getFunctionArgument(m_entryPoint, entryArgIdxs.relPatchId);
 
   // attribOffset = (location + locOffset) * 4 + compIdx
-  Value *attibOffset = ConstantInt::get(Type::getInt32Ty(*m_context), location);
+  Value *attribOffset = builder.getInt32(location);
 
   if (locOffset)
-    attibOffset = BinaryOperator::CreateAdd(attibOffset, locOffset, "", insertPos);
+    attribOffset = builder.CreateAdd(attribOffset, locOffset);
 
-  attibOffset =
-      BinaryOperator::CreateMul(attibOffset, ConstantInt::get(Type::getInt32Ty(*m_context), 4), "", insertPos);
+  attribOffset = builder.CreateMul(attribOffset, builder.getInt32(4));
 
   if (compIdx) {
     const unsigned bitWidth = inputTy->getScalarSizeInBits();
@@ -4827,10 +4697,10 @@ Value *PatchInOutImportExport::calcLdsOffsetForTesInput(Type *inputTy, unsigned 
 
     if (bitWidth == 64) {
       // For 64-bit data type, the component indexing must multiply by 2
-      compIdx = BinaryOperator::CreateMul(compIdx, ConstantInt::get(Type::getInt32Ty(*m_context), 2), "", insertPos);
+      compIdx = builder.CreateMul(compIdx, builder.getInt32(2));
     }
 
-    attibOffset = BinaryOperator::CreateAdd(attibOffset, compIdx, "", insertPos);
+    attribOffset = builder.CreateAdd(attribOffset, compIdx);
   }
 
   Value *ldsOffset = nullptr;
@@ -4838,27 +4708,26 @@ Value *PatchInOutImportExport::calcLdsOffsetForTesInput(Type *inputTy, unsigned 
   const bool perPatch = (!vertexIdx); // Vertex indexing is unavailable for per-patch input
   if (perPatch) {
     // dwordOffset = patchConstStart + relPatchId * patchConstSize + attribOffset
-    auto patchConstSize = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.patchConstSize);
-    ldsOffset = BinaryOperator::CreateMul(relPatchId, patchConstSize, "", insertPos);
+    auto patchConstSize = builder.getInt32(calcFactor.patchConstSize);
+    ldsOffset = builder.CreateMul(relPatchId, patchConstSize);
 
-    auto patchConstStartVal = ConstantInt::get(Type::getInt32Ty(*m_context), patchConstStart);
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, patchConstStartVal, "", insertPos);
+    auto patchConstStartVal = builder.getInt32(patchConstStart);
+    ldsOffset = builder.CreateAdd(ldsOffset, patchConstStartVal);
 
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, attibOffset, "", insertPos);
+    ldsOffset = builder.CreateAdd(ldsOffset, attribOffset);
   } else {
     // dwordOffset = patchStart + (relPatchId * vertexCount + vertexId) * vertexStride + attribOffset
     //             = patchStart + relPatchId * patchSize + vertexId  * vertexStride + attribOffset
-    auto patchSize = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.outPatchSize);
-    ldsOffset = BinaryOperator::CreateMul(relPatchId, patchSize, "", insertPos);
+    auto patchSize = builder.getInt32(calcFactor.outPatchSize);
+    ldsOffset = builder.CreateMul(relPatchId, patchSize);
 
-    auto patchStart = ConstantInt::get(Type::getInt32Ty(*m_context), outPatchStart);
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, patchStart, "", insertPos);
+    auto patchStart = builder.getInt32(outPatchStart);
+    ldsOffset = builder.CreateAdd(ldsOffset, patchStart);
 
-    auto vertexStride = ConstantInt::get(Type::getInt32Ty(*m_context), calcFactor.outVertexStride);
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, BinaryOperator::CreateMul(vertexIdx, vertexStride, "", insertPos),
-                                          "", insertPos);
+    auto vertexStride = builder.getInt32(calcFactor.outVertexStride);
+    ldsOffset = builder.CreateAdd(ldsOffset, builder.CreateMul(vertexIdx, vertexStride));
 
-    ldsOffset = BinaryOperator::CreateAdd(ldsOffset, attibOffset, "", insertPos);
+    ldsOffset = builder.CreateAdd(ldsOffset, attribOffset);
   }
 
   return ldsOffset;
@@ -4880,6 +4749,19 @@ unsigned PatchInOutImportExport::calcPatchCountPerThreadGroup(unsigned inVertexC
   unsigned maxThreadCountPerThreadGroup =
       m_gfxIp.major >= 9 ? Gfx9::MaxHsThreadsPerSubgroup : Gfx6::MaxHsThreadsPerSubgroup;
 
+#if VKI_RAY_TRACING
+  // NOTE: If ray query uses LDS stack, the expected max thread count in the group is 64. And we force wave size
+  // to be 64 in order to keep all threads in the same wave. In the future, we could consider to get rid of this
+  // restriction by providing the capability of querying thread ID in the group rather than in wave.
+  unsigned rayQueryLdsStackSize = 0;
+  const auto vsResUsage = m_pipelineState->getShaderResourceUsage(ShaderStageVertex);
+  const auto tcsResUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
+  if (vsResUsage->useRayQueryLdsStack || tcsResUsage->useRayQueryLdsStack) {
+    maxThreadCountPerThreadGroup = std::min(MaxRayQueryThreadsPerGroup, maxThreadCountPerThreadGroup);
+    rayQueryLdsStackSize = MaxRayQueryLdsStackEntries * MaxRayQueryThreadsPerGroup;
+  }
+#endif
+
   const unsigned maxThreadCountPerPatch = std::max(inVertexCount, outVertexCount);
   const unsigned patchCountLimitedByThread = maxThreadCountPerThreadGroup / maxThreadCountPerPatch;
 
@@ -4891,6 +4773,9 @@ unsigned PatchInOutImportExport::calcPatchCountPerThreadGroup(unsigned inVertexC
   unsigned ldsSizePerPatch = inPatchSize + MaxTessFactorsPerPatch;
 
   unsigned ldsSizePerThreadGroup = m_pipelineState->getTargetInfo().getGpuProperty().ldsSizePerThreadGroup;
+#if VKI_RAY_TRACING
+  ldsSizePerThreadGroup -= rayQueryLdsStackSize; // Exclude LDS space used as ray query stack
+#endif
   unsigned patchCountLimitedByLds = ldsSizePerThreadGroup / ldsSizePerPatch;
 
   unsigned patchCountPerThreadGroup = std::min(patchCountLimitedByThread, patchCountLimitedByLds);
@@ -5071,7 +4956,9 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
   assert(useExpInst);
   (void(useExpInst)); // unused
 
-  auto &inOutUsage = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage;
+  const auto &inOutUsage = m_pipelineState->getShaderResourceUsage(m_shaderStage)->inOutUsage;
+  const auto &builtInOutLocs =
+      m_shaderStage == ShaderStageCopyShader ? inOutUsage.gs.builtInOutLocs : inOutUsage.builtInOutputLocMap;
 
   const auto undef = UndefValue::get(Type::getFloatTy(*m_context));
 
@@ -5132,31 +5019,27 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
     emitCall("llvm.amdgcn.exp.f32", Type::getVoidTy(*m_context), args, {}, insertPos);
 
     // NOTE: We have to export gl_Layer via generic outputs as well.
-    bool hasLayerExport = true;
     if (nextStage == ShaderStageFragment) {
       const auto &nextBuiltInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
-
-      hasLayerExport = nextBuiltInUsage.layer || nextBuiltInUsage.viewIndex;
-    } else if (nextStage == ShaderStageInvalid) {
-      hasLayerExport = false;
-    }
-
-    if (hasLayerExport) {
       unsigned loc = InvalidValue;
-      if (m_shaderStage == ShaderStageCopyShader) {
-        assert(inOutUsage.gs.builtInOutLocs.find(BuiltInLayer) != inOutUsage.gs.builtInOutLocs.end() ||
-               inOutUsage.gs.builtInOutLocs.find(BuiltInViewIndex) != inOutUsage.gs.builtInOutLocs.end());
-        loc = enableMultiView ? inOutUsage.gs.builtInOutLocs[BuiltInViewIndex]
-                              : inOutUsage.gs.builtInOutLocs[BuiltInLayer];
-      } else {
-        assert(inOutUsage.builtInOutputLocMap.find(BuiltInLayer) != inOutUsage.builtInOutputLocMap.end() ||
-               inOutUsage.builtInOutputLocMap.find(BuiltInViewIndex) != inOutUsage.builtInOutputLocMap.end());
-
-        loc = enableMultiView ? inOutUsage.builtInOutputLocMap[BuiltInViewIndex]
-                              : inOutUsage.builtInOutputLocMap[BuiltInLayer];
+      Value *layer = nullptr;
+      if (nextBuiltInUsage.layer) {
+        assert(builtInOutLocs.find(BuiltInLayer) != builtInOutLocs.end());
+        loc = builtInOutLocs.find(BuiltInLayer)->second;
+        layer = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
       }
 
-      recordVertexAttribExport(loc, {layer, undef, undef, undef});
+      if (nextBuiltInUsage.viewIndex) {
+        assert(builtInOutLocs.find(BuiltInViewIndex) != builtInOutLocs.end());
+        loc = builtInOutLocs.find(BuiltInViewIndex)->second;
+
+        if (enableMultiView)
+          layer = new BitCastInst(output, Type::getFloatTy(*m_context), "", insertPos);
+        else
+          layer = ConstantFP::get(Type::getFloatTy(*m_context), 0.0f);
+      }
+      if (layer)
+        recordVertexAttribExport(loc, {layer, undef, undef, undef});
     }
 
     break;
@@ -5188,14 +5071,8 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
     }
 
     if (hasViewportIndexExport) {
-      unsigned loc = InvalidValue;
-      if (m_shaderStage == ShaderStageCopyShader) {
-        assert(inOutUsage.gs.builtInOutLocs.find(BuiltInViewportIndex) != inOutUsage.gs.builtInOutLocs.end());
-        loc = inOutUsage.gs.builtInOutLocs[BuiltInViewportIndex];
-      } else {
-        assert(inOutUsage.builtInOutputLocMap.find(BuiltInViewportIndex) != inOutUsage.builtInOutputLocMap.end());
-        loc = inOutUsage.builtInOutputLocMap[BuiltInViewportIndex];
-      }
+      assert(builtInOutLocs.find(BuiltInViewportIndex) != builtInOutLocs.end());
+      const unsigned loc = builtInOutLocs.find(BuiltInViewportIndex)->second;
 
       recordVertexAttribExport(loc, {viewportIndex, undef, undef, undef});
     }
@@ -5221,8 +5098,8 @@ void PatchInOutImportExport::addExportInstForBuiltInOutput(Value *output, unsign
 //
 // @param centroidIj : Centroid I/J provided by hardware natively
 // @param centerIj : Center I/J provided by hardware natively
-// @param insertPos : Where to insert this call
-Value *PatchInOutImportExport::adjustCentroidIj(Value *centroidIj, Value *centerIj, Instruction *insertPos) {
+// @param builder : The IR builder to create and insert IR instruction
+Value *PatchInOutImportExport::adjustCentroidIj(Value *centroidIj, Value *centerIj, BuilderBase &builder) {
   auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageFragment)->entryArgIdxs.fs;
   auto primMask = getFunctionArgument(m_entryPoint, entryArgIdxs.primMask);
   auto &builtInUsage = m_pipelineState->getShaderResourceUsage(ShaderStageFragment)->builtInUsage.fs;
@@ -5232,9 +5109,8 @@ Value *PatchInOutImportExport::adjustCentroidIj(Value *centroidIj, Value *center
     // NOTE: If both centroid and center are enabled, centroid I/J provided by hardware natively may be invalid. We have
     // to adjust it with center I/J on condition of bc_optimize flag. bc_optimize = pPrimMask[31], when bc_optimize is
     // on, pPrimMask is less than zero
-    auto cond =
-        new ICmpInst(insertPos, ICmpInst::ICMP_SLT, primMask, ConstantInt::get(Type::getInt32Ty(*m_context), 0), "");
-    ij = SelectInst::Create(cond, centerIj, centroidIj, "", insertPos);
+    auto cond = builder.CreateICmpSLT(primMask, builder.getInt32(0));
+    ij = builder.CreateSelect(cond, centerIj, centroidIj);
   } else
     ij = centroidIj;
 
@@ -5244,7 +5120,7 @@ Value *PatchInOutImportExport::adjustCentroidIj(Value *centroidIj, Value *center
 // =====================================================================================================================
 // Get Subgroup local invocation Id
 //
-// @param builder : The builder to use
+// @param builder : The IR builder to create and insert IR instruction
 Value *PatchInOutImportExport::getSubgroupLocalInvocationId(BuilderBase &builder) {
   Value *subgroupLocalInvocationId =
       builder.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {builder.getInt32(-1), builder.getInt32(0)});
@@ -5361,7 +5237,7 @@ Value *PatchInOutImportExport::reconfigWorkgroup(Value *localInvocationId, Instr
 
     if (isPowerOf2_32(workgroupSizeYMul8)) {
       // If we have a power of two, we can use a right shift to compute the division more efficiently.
-      offset = BinaryOperator::CreateLShr(x, ConstantInt::get(int32Ty, Log2(workgroupSizeYMul8)), "", insertPos);
+      offset = BinaryOperator::CreateLShr(x, ConstantInt::get(int32Ty, log2(workgroupSizeYMul8)), "", insertPos);
     } else {
       // Otherwise we truncate down to a 16-bit integer, do the division, and zero extend. This will
       // result in significantly less instructions to do the divide.
@@ -5426,7 +5302,7 @@ Value *PatchInOutImportExport::reconfigWorkgroup(Value *localInvocationId, Instr
 
     if (isPowerOf2_32(workgroupSizeXMul2)) {
       // If we have a power of two, we can use a right shift to compute the division more efficiently.
-      div = BinaryOperator::CreateLShr(maskedX, ConstantInt::get(int32Ty, Log2(workgroupSizeXMul2)), "", insertPos);
+      div = BinaryOperator::CreateLShr(maskedX, ConstantInt::get(int32Ty, log2(workgroupSizeXMul2)), "", insertPos);
     } else {
       // Otherwise we truncate down to a 16-bit integer, do the division, and zero extend. This will
       // result in significantly less instructions to do the divide.
@@ -5483,7 +5359,7 @@ Value *PatchInOutImportExport::reconfigWorkgroup(Value *localInvocationId, Instr
 // @param localInvocationId : The original workgroup ID.
 // @param insertPos : Where to insert instructions.
 Value *PatchInOutImportExport::swizzleLocalInvocationIdIn8x4(Value *localInvocationId, Instruction *insertPos) {
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
   builder.SetInsertPoint(insertPos);
   auto &mode = m_pipelineState->getShaderModes()->getComputeShaderMode();
 
@@ -5864,7 +5740,7 @@ void PatchInOutImportExport::createSwizzleThreadGroupFunction() {
 // @param shadingRate : LGC shading rate
 // @param insertPos : Where to insert instructions.
 void PatchInOutImportExport::exportShadingRate(Value *shadingRate, Instruction *insertPos) {
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
   builder.SetInsertPoint(insertPos);
 
   assert(m_gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
@@ -5917,7 +5793,7 @@ void PatchInOutImportExport::exportShadingRate(Value *shadingRate, Instruction *
 //
 // @param insertPos : Where to insert instructions.
 Value *PatchInOutImportExport::getShadingRate(Instruction *insertPos) {
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
   builder.SetInsertPoint(insertPos);
 
   assert(m_gfxIp >= GfxIpVersion({10, 3})); // Must be GFX10.3+
@@ -6005,7 +5881,7 @@ void PatchInOutImportExport::exportVertexAttribs(Instruction *insertPos) {
     return;
   }
 
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
   builder.SetInsertPoint(insertPos);
 
   for (auto &attribExport : m_attribExports) {
@@ -6053,7 +5929,7 @@ void PatchInOutImportExport::storeTessFactors() {
   }
   assert(insertPos); // Must have ret instruction
 
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
   builder.SetInsertPoint(insertPos);
 
   //
@@ -6081,7 +5957,7 @@ void PatchInOutImportExport::storeTessFactors() {
     break;
   }
 
-  auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
+  const auto &calcFactor = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl)->inOutUsage.tcs.calcFactor;
   auto relativeId = m_pipelineSysValues.get(m_entryPoint)->getRelativeId();
 
   // NOTE: We are going to read back tess factors from on-chip LDS. Make sure they have been stored already.
@@ -6097,7 +5973,7 @@ void PatchInOutImportExport::storeTessFactors() {
   Value *ldsOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
   ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(calcFactor.onChip.tessFactorStart));
   auto outerTessFactorVec =
-      readValueFromLds(false, FixedVectorType::get(builder.getFloatTy(), outerTessFactorCount), ldsOffset, insertPos);
+      readValueFromLds(false, FixedVectorType::get(builder.getFloatTy(), outerTessFactorCount), ldsOffset, builder);
   for (unsigned i = 0; i < outerTessFactorCount; ++i)
     outerTessFactors.push_back(builder.CreateExtractElement(outerTessFactorVec, i));
 
@@ -6107,7 +5983,7 @@ void PatchInOutImportExport::storeTessFactors() {
     Value *ldsOffset = builder.CreateMul(relativeId, builder.getInt32(MaxTessFactorsPerPatch));
     ldsOffset = builder.CreateAdd(ldsOffset, builder.getInt32(calcFactor.onChip.tessFactorStart + 4));
     auto innerTessFactorVec =
-        readValueFromLds(false, FixedVectorType::get(builder.getFloatTy(), innerTessFactorCount), ldsOffset, insertPos);
+        readValueFromLds(false, FixedVectorType::get(builder.getFloatTy(), innerTessFactorCount), ldsOffset, builder);
     for (unsigned i = 0; i < innerTessFactorCount; ++i)
       innerTessFactors.push_back(builder.CreateExtractElement(innerTessFactorVec, i));
   }
@@ -6116,28 +5992,28 @@ void PatchInOutImportExport::storeTessFactors() {
     //
     // Write tessellation factors to LDS if they are read as inputs by TES
     //
-    auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
-    auto &perPatchBuiltInOutLocMap = resUsage->inOutUsage.perPatchBuiltInOutputLocMap;
+    const auto resUsage = m_pipelineState->getShaderResourceUsage(ShaderStageTessControl);
+    const auto &perPatchBuiltInOutLocMap = resUsage->inOutUsage.perPatchBuiltInOutputLocMap;
 
-    bool writeTessFactorToLds = perPatchBuiltInOutLocMap.count(BuiltInTessLevelOuter) > 0;
-    if (writeTessFactorToLds) {
-      const unsigned loc = perPatchBuiltInOutLocMap[BuiltInTessLevelOuter];
+    auto tessLevelOuterLocIt = perPatchBuiltInOutLocMap.find(BuiltInTessLevelOuter);
+    if (tessLevelOuterLocIt != perPatchBuiltInOutLocMap.end()) {
+      const unsigned loc = tessLevelOuterLocIt->second;
 
       for (unsigned i = 0; i < outerTessFactorCount; ++i) {
         auto ldsOffset =
-            calcLdsOffsetForTcsOutput(builder.getFloatTy(), loc, nullptr, builder.getInt32(i), nullptr, insertPos);
-        writeValueToLds(m_pipelineState->isTessOffChip(), outerTessFactors[i], ldsOffset, insertPos);
+            calcLdsOffsetForTcsOutput(builder.getFloatTy(), loc, nullptr, builder.getInt32(i), nullptr, builder);
+        writeValueToLds(m_pipelineState->isTessOffChip(), outerTessFactors[i], ldsOffset, builder);
       }
     }
 
-    writeTessFactorToLds = perPatchBuiltInOutLocMap.count(BuiltInTessLevelInner) > 0;
-    if (writeTessFactorToLds) {
-      const unsigned loc = perPatchBuiltInOutLocMap[BuiltInTessLevelInner];
+    auto tessLevelInnerLocIt = perPatchBuiltInOutLocMap.find(BuiltInTessLevelInner);
+    if (tessLevelInnerLocIt != perPatchBuiltInOutLocMap.end()) {
+      const unsigned loc = tessLevelInnerLocIt->second;
 
       for (unsigned i = 0; i < innerTessFactorCount; ++i) {
         auto ldsOffset =
-            calcLdsOffsetForTcsOutput(builder.getFloatTy(), loc, nullptr, builder.getInt32(i), nullptr, insertPos);
-        writeValueToLds(m_pipelineState->isTessOffChip(), innerTessFactors[i], ldsOffset, insertPos);
+            calcLdsOffsetForTcsOutput(builder.getFloatTy(), loc, nullptr, builder.getInt32(i), nullptr, builder);
+        writeValueToLds(m_pipelineState->isTessOffChip(), innerTessFactors[i], ldsOffset, builder);
       }
     }
 
@@ -6176,7 +6052,7 @@ void PatchInOutImportExport::storeTessFactorToBuffer(ArrayRef<Value *> outerTess
   //      tessFactor[4] = gl_TessLevelInner[0]
   //      tessFactor[5] = gl_TessLevelInner[1]
 
-  IRBuilder<> builder(*m_context);
+  BuilderBase builder(*m_context);
   builder.SetInsertPoint(insertPos);
 
   Value *tfBufferDesc = m_pipelineSysValues.get(m_entryPoint)->getTessFactorBufDesc();

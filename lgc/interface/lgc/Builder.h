@@ -433,6 +433,12 @@ public:
   // @param instName : Name to give instruction(s)
   virtual llvm::Value *CreateSqrt(llvm::Value *x, const llvm::Twine &instName = "") = 0;
 
+  // Create an inverse square root operation for a scalar or vector FP type
+  //
+  // @param x : Input value X
+  // @param instName : Name to give instruction(s)
+  virtual llvm::Value *CreateInverseSqrt(llvm::Value *x, const llvm::Twine &instName = "") = 0;
+
   // Create "signed integer abs" operation for a scalar or vector integer value.
   //
   // @param x : Input value X
@@ -692,8 +698,12 @@ public:
   enum {
     BufferFlagNonUniform = 1, // Descriptor index is non-uniform
     BufferFlagWritten = 2,    // Buffer is (or might be) written to
-    BufferFlagReserved4 = 4,  // Reserved for future functionality
-    BufferFlagReserved8 = 8,  // Reserved for future functionality
+    BufferFlagConst = 4,      // Const buffer: Find a DescriptorConstBuffer/DescriptorConstBufferCompact/InlineBuffer
+                              //  descriptor entry, rather than DescriptorBuffer/DescriptorBufferCompact
+    BufferFlagNonConst = 8,   // Non-const buffer: Find a DescriptorBuffer/DescriptorBufferCompact descriptor
+                              //  entry, rather than DescriptorConstBuffer/DescriptorConstBufferCompact/InlineBuffer
+    BufferFlagShaderResource = 16, // Flag to find a Descriptor Resource
+    BufferFlagSampler = 32         // Flag to find Descriptor Sampler
   };
 
   // Get the type of pointer returned by CreateLoadBufferDesc.
@@ -725,24 +735,27 @@ public:
 
   // Create a get of the stride (in bytes) of a descriptor. Returns an i32 value.
   //
-  // @param descType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+  // @param concreteType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+  //                   DescriptorTexelBuffer, DescriptorFmask.
+  // @param abstractType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
   //                   DescriptorTexelBuffer, DescriptorFmask.
   // @param descSet : Descriptor set
   // @param binding : Descriptor binding
   // @param instName : Name to give instruction(s)
-  virtual llvm::Value *CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                           const llvm::Twine &instName = "") = 0;
+  virtual llvm::Value *CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType,
+                                           unsigned descSet, unsigned binding, const llvm::Twine &instName = "") = 0;
 
   // Create a pointer to a descriptor. Returns a value of the type returned by GetSamplerDescPtrTy, GetImageDescPtrTy,
   // GetTexelBufferDescPtrTy or GetFmaskDescPtrTy, depending on descType.
   //
-  // @param descType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+  // @param concreteType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
   //                   DescriptorTexelBuffer, DescriptorFmask.
+  // @param abstractType : Descriptor type to find user resource nodes;
   // @param descSet : Descriptor set
   // @param binding : Descriptor binding
   // @param instName : Name to give instruction(s)
-  virtual llvm::Value *CreateGetDescPtr(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                        const llvm::Twine &instName = "") = 0;
+  virtual llvm::Value *CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                                        unsigned binding, const llvm::Twine &instName = "") = 0;
 
   // Create a load of the push constants pointer.
   // This returns a pointer to the ResourceNodeType::PushConst resource in the top-level user data table.
@@ -1080,6 +1093,22 @@ public:
   virtual llvm::Value *CreateImageGetLod(unsigned dim, unsigned flags, llvm::Value *imageDesc, llvm::Value *samplerDesc,
                                          llvm::Value *coord, const llvm::Twine &instName = "") = 0;
 
+#if VKI_RAY_TRACING
+  // Create a ray intersect result with specified node in BVH buffer.
+  // pNodePtr is the combination of BVH node offset type.
+  //
+  // @param nodePtr : BVH node pointer
+  // @param extent : The valid range on which intersections can occur
+  // @param origin : Intersect ray origin
+  // @param direction : Intersect ray direction
+  // @param invDirection : The inverse of direction
+  // @param imageDesc : Image descriptor
+  // @param instName : Name to give instruction(s)
+  virtual llvm::Value *CreateImageBvhIntersectRay(llvm::Value *nodePtr, llvm::Value *extent, llvm::Value *origin,
+                                                  llvm::Value *direction, llvm::Value *invDirection,
+                                                  llvm::Value *imageDesc, const llvm::Twine &instName = "");
+#endif
+
   // -----------------------------------------------------------------------------------------------------------------
   // Shader input/output methods
 
@@ -1202,6 +1231,16 @@ public:
   // @param inOutInfo : Extra input/output info (shader-defined array length)
   llvm::Type *getBuiltInTy(BuiltInKind builtIn, InOutInfo inOutInfo);
 
+  // Create a read of barycoord input value.
+  // The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
+  //
+  // @param builtIn : Built-in kind, BuiltInBaryCoord or BuiltInBaryCoordNoPerspKHR
+  // @param inputInfo : Extra input info
+  // @param auxInterpValue : Auxiliary value of interpolation
+  // @param instName : Name to give instruction(s)
+  virtual llvm::Value *CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
+                                           const llvm::Twine &instName = "") = 0;
+
   // Create a read of (part of) a built-in input value.
   // The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
   // or the element type if pIndex is not nullptr. For ClipDistance or CullDistance when pIndex is nullptr,
@@ -1249,7 +1288,7 @@ public:
   // @param resultTy : Type of value to read
   // @param byteOffset : Byte offset within the payload structure
   // @param instName : Name to give instruction(s)
-  // @returns Value read from the task payload
+  // @returns : Value read from the task payload
   virtual llvm::Value *CreateReadTaskPayload(llvm::Type *resultTy, llvm::Value *byteOffset, // NOLINT
                                              const llvm::Twine &instName = "") = 0;
 
@@ -1259,8 +1298,35 @@ public:
   // @param byteOffset : Byte offset within the payload structure
   // @param instName : Name to give instruction(s)
   // @returns Instruction to write value to task payload
+  // @returns : Original value read from the task payload
   virtual llvm::Instruction *CreateWriteTaskPayload(llvm::Value *valueToWrite, llvm::Value *byteOffset, // NOLINT
                                                     const llvm::Twine &instName = "") = 0;
+
+  // Create a task payload atomic operation other than compare-and-swap. An add of +1 or -1, or a sub
+  // of -1 or +1, is generated as inc or dec. Result type is the same as the input value type.
+  //
+  // @param atomicOp : Atomic op to create
+  // @param ordering : Atomic ordering
+  // @param inputValue : Input value
+  // @param byteOffset : Byte offset within the payload structure
+  // @param instName : Name to give instruction(s)
+  // @returns : Original value read from the task payload
+  virtual llvm::Value *CreateTaskPayloadAtomic(unsigned atomicOp, llvm::AtomicOrdering ordering, // NOLINT
+                                               llvm::Value *inputValue, llvm::Value *byteOffset,
+                                               const llvm::Twine &instName = "") = 0;
+
+  // Create a task payload atomic compare-and-swap.
+  //
+  // @param ordering : Atomic ordering
+  // @param inputValue : Input value
+  // @param comparatorValue : Value to compare against
+  // @param byteOffset : Byte offset within the payload structure
+  // @param instName : Name to give instruction(s)
+  // @returns : Original value read from the task payload
+  virtual llvm::Value *CreateTaskPayloadAtomicCompareSwap(llvm::AtomicOrdering ordering, // NOLINT
+                                                          llvm::Value *inputValue, llvm::Value *comparatorValue,
+                                                          llvm::Value *byteOffset,
+                                                          const llvm::Twine &instName = "") = 0;
 
   // -----------------------------------------------------------------------------------------------------------------
   // Matrix operations

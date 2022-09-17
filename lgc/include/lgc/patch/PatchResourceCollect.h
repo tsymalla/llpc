@@ -70,6 +70,10 @@ private:
 
   bool isVertexReuseDisabled();
 
+#if VKI_RAY_TRACING
+  void checkRayQueryLdsStackUsage(llvm::Module *module);
+#endif
+
   void clearInactiveBuiltInInput();
   void clearInactiveBuiltInOutput();
   void clearUnusedOutput();
@@ -109,6 +113,7 @@ private:
   std::unique_ptr<InOutLocationInfoMapManager>
       m_locationInfoMapManager; // Pointer to InOutLocationInfoMapManager instance
 
+  bool m_tcsInputHasDynamicIndexing = false; // Whether there is a dynamically indexed TCS input.
   bool m_processMissingFs = false; // Whether to process a missing FS (part-pipeline compilation).
 };
 

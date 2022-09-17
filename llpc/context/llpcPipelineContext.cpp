@@ -142,13 +142,38 @@ static cl::opt<bool> ScalarizeWaterfallDescriptorLoads("scalarize-waterfall-desc
 
 namespace Llpc {
 
+#if VKI_RAY_TRACING
+#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION < 15
+static const char *TraceRayFuncNames[Vkgc::RT_ENTRY_FUNC_COUNT] = {
+    "TraceRaysAmdInternal",       // RT_ENTRY_TRACE_RAY,
+    "TraceRayInlineAmdInternal",  // RT_ENTRY_TRACE_RAY_INLINE,
+    "",                           // RT_ENTRY_TRACE_RAY_HIT_TOKEN,
+    "RayQueryProceedAmdInternal", // RT_ENTRY_RAY_QUERY_PROCEED,
+    "",                           // RT_ENTRY_INSTANCE_INDEX,
+    "",                           // RT_ENTRY_INSTANCE_ID,
+    "",                           // RT_ENTRY_OBJECT_TO_WORLD_TRANSFORM,
+    "",                           // RT_ENTRY_WORLD_TO_OBJECT_TRANSFORM,
+};
+#endif
+#endif
+
 // =====================================================================================================================
 //
 // @param gfxIp : Graphics IP version info
 // @param pipelineHash : Pipeline hash code
 // @param cacheHash : Cache hash code
-PipelineContext::PipelineContext(GfxIpVersion gfxIp, MetroHash::Hash *pipelineHash, MetroHash::Hash *cacheHash)
-    : m_gfxIp(gfxIp), m_pipelineHash(*pipelineHash), m_cacheHash(*cacheHash), m_resourceMapping() {
+PipelineContext::PipelineContext(GfxIpVersion gfxIp, MetroHash::Hash *pipelineHash, MetroHash::Hash *cacheHash
+#if VKI_RAY_TRACING
+                                 ,
+                                 const Vkgc::RtState *rtState
+#endif
+                                 )
+    : m_gfxIp(gfxIp), m_pipelineHash(*pipelineHash), m_cacheHash(*cacheHash)
+#if VKI_RAY_TRACING
+      ,
+      m_rtState(rtState)
+#endif
+{
 }
 
 // =====================================================================================================================
@@ -202,6 +227,21 @@ ShaderHash PipelineContext::getShaderHashCode(ShaderStage stage) const {
   return hash;
 }
 
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Return ray tracing/ray query entry function names
+//
+// @param funcType : function type
+const char *PipelineContext::getRayTracingFunctionName(unsigned funcType) {
+  assert(funcType < Vkgc::RT_ENTRY_FUNC_COUNT);
+#if GPURT_CLIENT_INTERFACE_MAJOR_VERSION >= 15
+  return getRayTracingState()->gpurtFuncTable.pFunc[funcType];
+#else
+  return TraceRayFuncNames[funcType];
+#endif
+}
+#endif
+
 // =====================================================================================================================
 // Set pipeline state in Pipeline object for middle-end and/or calculate the hash for the state to be added.
 // Doing both these things in the same code ensures that we hash and use the same pipeline state in all situations.
@@ -217,6 +257,10 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
   // Give the shader stage mask to the middle-end. We need to translate the Vkgc::ShaderStage bit numbers
   // to lgc::ShaderStage bit numbers. We only process native shader stages, ignoring the CopyShader stage.
   unsigned stageMask = getShaderStageMask();
+#if VKI_RAY_TRACING
+  if (hasRayTracingShaderStage(stageMask))
+    stageMask = ShaderStageComputeBit;
+#endif
   unsigned lgcStageMask = 0;
   const auto stages = maskToShaderStages(stageMask);
   for (ShaderStage stage : make_filter_range(stages, isNativeStage)) {
@@ -232,13 +276,13 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
       pipeline->setPreRasterHasGs(true);
   }
 
-  // Give the pipeline options to the middle-end, and/or hash them.
-  setOptionsInPipeline(pipeline, hasher);
-
   if (!unlinked) {
     // Give the user data nodes to the middle-end, and/or hash them.
     setUserDataInPipeline(pipeline, hasher, stageMask);
   }
+
+  // Give the pipeline options to the middle-end, and/or hash them.
+  setOptionsInPipeline(pipeline, hasher);
 
   if (isGraphics()) {
     if ((stageMask & ~shaderStageToMask(ShaderStageFragment)) && (!unlinked || DisableFetchShader)) {
@@ -254,6 +298,9 @@ void PipelineContext::setPipelineState(Pipeline *pipeline, Util::MetroHash64 *ha
     // Give the graphics pipeline state to the middle-end.
     setGraphicsStateInPipeline(pipeline, hasher, stageMask);
   } else {
+#if VKI_RAY_TRACING
+    if (!hasRayTracingShaderStage(stageMask))
+#endif
     {
       unsigned deviceIndex = static_cast<const ComputePipelineBuildInfo *>(getPipelineBuildInfo())->deviceIndex;
       if (pipeline)
@@ -285,6 +332,11 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 
   options.threadGroupSwizzleMode =
       static_cast<lgc::ThreadGroupSwizzleMode>(getPipelineOptions()->threadGroupSwizzleMode);
+
+  if (getPipelineOptions()->reverseThreadGroup) {
+    options.reverseThreadGroupBufferDescSet = Vkgc::InternalDescriptorSetId;
+    options.reverseThreadGroupBufferBinding = Vkgc::ReverseThreadGroupControlBinding;
+  }
 
   switch (getPipelineOptions()->shadowDescriptorTableUsage) {
   case Vkgc::ShadowDescriptorTableUsage::Auto:
@@ -357,6 +409,12 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 
   // Driver report full subgroup lanes for compute shader, here we just set fullSubgroups as default options
   options.fullSubgroups = true;
+#if VKI_RAY_TRACING
+  // NOTE: raytracing waveSize and subgroupSize can be different.
+  if (isRayTracing()) {
+    options.fullSubgroups = false;
+  }
+#endif
   if (pipeline)
     pipeline->setOptions(options);
   if (hasher)
@@ -407,11 +465,21 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
 
     shaderOptions.waveSize = shaderInfo->options.waveSize;
     shaderOptions.wgpMode = shaderInfo->options.wgpMode;
-    if (!shaderInfo->options.allowVaryWaveSize) {
+
+    // If subgroupSize is specified, we should use the specified value.
+    if (shaderInfo->options.subgroupSize != 0)
+      shaderOptions.subgroupSize = shaderInfo->options.subgroupSize;
+    else if (!shaderInfo->options.allowVaryWaveSize) {
       // allowVaryWaveSize is disabled, so use -subgroup-size (default 64) to override the wave
       // size for a shader that uses gl_SubgroupSize.
       shaderOptions.subgroupSize = SubgroupSize;
     }
+#if VKI_RAY_TRACING
+    // NOTE: WaveSize of raytracing usually be 32
+    if (hasRayQuery() || isRayTracing()) {
+      shaderOptions.waveSize = getRayTracingWaveSize();
+    }
+#endif
 
     // Use a static cast from Vkgc WaveBreakSize to LGC WaveBreak, and static assert that
     // that is valid.
@@ -469,6 +537,10 @@ void PipelineContext::setOptionsInPipeline(Pipeline *pipeline, Util::MetroHash64
       shaderOptions.ldsSpillLimitDwords = shaderInfo->options.ldsSpillLimitDwords;
     else
       shaderOptions.ldsSpillLimitDwords = LdsSpillLimitDwords;
+
+    shaderOptions.overrideShaderThreadGroupSizeX = shaderInfo->options.overrideShaderThreadGroupSizeX;
+    shaderOptions.overrideShaderThreadGroupSizeY = shaderInfo->options.overrideShaderThreadGroupSizeY;
+    shaderOptions.overrideShaderThreadGroupSizeZ = shaderInfo->options.overrideShaderThreadGroupSizeZ;
 
     pipeline->setShaderOptions(getLgcShaderStage(static_cast<ShaderStage>(stage)), shaderOptions);
   }
@@ -550,11 +622,13 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
 
     destNode.sizeInDwords = node.sizeInDwords;
     destNode.offsetInDwords = node.offsetInDwords;
+    destNode.abstractType = ResourceNodeType::Unknown;
 
     switch (node.type) {
     case ResourceMappingNodeType::DescriptorTableVaPtr: {
       // Process an inner table.
-      destNode.type = ResourceNodeType::DescriptorTableVaPtr;
+      destNode.concreteType = ResourceNodeType::DescriptorTableVaPtr;
+      destNode.abstractType = ResourceNodeType::DescriptorTableVaPtr;
       destInnerTable -= node.tablePtr.nodeCount;
       destNode.innerTable = ArrayRef<ResourceNode>(destInnerTable, node.tablePtr.nodeCount);
       setUserDataNodesTable(pipeline, ArrayRef<ResourceMappingNode>(node.tablePtr.pNext, node.tablePtr.nodeCount),
@@ -563,13 +637,15 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
     }
     case ResourceMappingNodeType::IndirectUserDataVaPtr: {
       // Process an indirect pointer.
-      destNode.type = ResourceNodeType::IndirectUserDataVaPtr;
+      destNode.concreteType = ResourceNodeType::IndirectUserDataVaPtr;
+      destNode.abstractType = ResourceNodeType::IndirectUserDataVaPtr;
       destNode.indirectSizeInDwords = node.userDataPtr.sizeInDwords;
       break;
     }
     case ResourceMappingNodeType::StreamOutTableVaPtr: {
       // Process an indirect pointer.
-      destNode.type = ResourceNodeType::StreamOutTableVaPtr;
+      destNode.concreteType = ResourceNodeType::StreamOutTableVaPtr;
+      destNode.abstractType = ResourceNodeType::StreamOutTableVaPtr;
       destNode.indirectSizeInDwords = node.userDataPtr.sizeInDwords;
       break;
     }
@@ -606,22 +682,23 @@ void PipelineContext::setUserDataNodesTable(Pipeline *pipeline, ArrayRef<Resourc
       // A "PushConst" is in fact an InlineBuffer when it appears in a non-root table.
       if (node.type == ResourceMappingNodeType::PushConst && !isRoot)
 #endif
-        destNode.type = ResourceNodeType::InlineBuffer;
+        destNode.concreteType = ResourceNodeType::InlineBuffer;
       else if (node.type == ResourceMappingNodeType::DescriptorYCbCrSampler)
-        destNode.type = ResourceNodeType::DescriptorResource;
+        destNode.concreteType = ResourceNodeType::DescriptorResource;
       else if (node.type == ResourceMappingNodeType::DescriptorImage)
-        destNode.type = ResourceNodeType::DescriptorResource;
+        destNode.concreteType = ResourceNodeType::DescriptorResource;
       else if (node.type == ResourceMappingNodeType::DescriptorConstTexelBuffer)
-        destNode.type = ResourceNodeType::DescriptorTexelBuffer;
+        destNode.concreteType = ResourceNodeType::DescriptorTexelBuffer;
       else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorConstBufferCompact)
-        destNode.type = ResourceNodeType::DescriptorBufferCompact;
+        destNode.concreteType = ResourceNodeType::DescriptorBufferCompact;
       else if (node.type == Vkgc::ResourceMappingNodeType::DescriptorConstBuffer)
-        destNode.type = ResourceNodeType::DescriptorBuffer;
+        destNode.concreteType = ResourceNodeType::DescriptorBuffer;
       else
-        destNode.type = static_cast<ResourceNodeType>(node.type);
+        destNode.concreteType = static_cast<ResourceNodeType>(node.type);
 
       destNode.set = node.srdRange.set;
       destNode.binding = node.srdRange.binding;
+      destNode.abstractType = destNode.concreteType;
       destNode.immutableValue = nullptr;
       destNode.immutableSize = 0;
       switch (node.type) {
@@ -905,6 +982,17 @@ void PipelineContext::setColorExportState(Pipeline *pipeline, Util::MetroHash64 
 
   pipeline->setColorExportState(formats, state);
 }
+
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Get wave size used for raytracing
+unsigned PipelineContext::getRayTracingWaveSize() const {
+  if ((m_gfxIp.major >= 10) && !isGraphics())
+    return 32;
+  return 64;
+}
+
+#endif
 
 // =====================================================================================================================
 // Map a VkFormat to a {BufDataFormat, BufNumFormat}. Returns BufDataFormatInvalid if the

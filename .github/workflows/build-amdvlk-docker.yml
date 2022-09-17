@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         host-os:        ["ubuntu-20.04"]
-        image-template: ["gcr.io/stadia-open-source/amdvlk_%s%s:nightly"]
+        image-template: ["us-docker.pkg.dev/stadia-open-source/amdvlk-public-ci/amdvlk_%s%s:nightly"]
         branch:         [dev]
         config:         [Release]
         feature-set:    ["+gcc", "+gcc+assertions",
@@ -43,9 +43,9 @@ jobs:
           credentials_json: '${{ secrets.GCR_KEY }}'
       - name: Setup Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v0
-      - name: Setup Docker to use the GCR
+      - name: Setup Docker to use the Google Cloud Artifact Registry
         run: |
-          gcloud auth configure-docker
+          gcloud auth configure-docker us-docker.pkg.dev --quiet
       - name: Generate Docker image tag string
         run: |
           CONFIG_LOWER=$(echo "${{ matrix.config }}" | tr "[:upper:]" "[:lower:]")
@@ -63,3 +63,7 @@ jobs:
       - name: Push the new image
         run: |
           docker push "$IMAGE_TAG"
+      - name: Garbage collect old docker images
+        if: matrix.feature-set == '+clang'
+        run: |
+          python3 script/gc-amdvlk-docker-images.py

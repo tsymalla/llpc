@@ -135,15 +135,24 @@ bool PatchCheckShaderCache::runImpl(Module &module, PipelineState *pipelineState
     streamMapEntries(resUsage->inOutUsage.outputLocInfoMap, stream);
     streamMapEntries(resUsage->inOutUsage.perPatchInputLocMap, stream);
     streamMapEntries(resUsage->inOutUsage.perPatchOutputLocMap, stream);
+    streamMapEntries(resUsage->inOutUsage.perPrimitiveInputLocMap, stream);
+    streamMapEntries(resUsage->inOutUsage.perPrimitiveOutputLocMap, stream);
     streamMapEntries(resUsage->inOutUsage.builtInInputLocMap, stream);
     streamMapEntries(resUsage->inOutUsage.builtInOutputLocMap, stream);
     streamMapEntries(resUsage->inOutUsage.perPatchBuiltInInputLocMap, stream);
     streamMapEntries(resUsage->inOutUsage.perPatchBuiltInOutputLocMap, stream);
+    streamMapEntries(resUsage->inOutUsage.perPrimitiveBuiltInInputLocMap, stream);
+    streamMapEntries(resUsage->inOutUsage.perPrimitiveBuiltInOutputLocMap, stream);
 
     if (stage == ShaderStageGeometry) {
       // NOTE: For geometry shader, copy shader will use this special map info (from built-in outputs to
       // locations of generic outputs). We have to add it to shader hash calculation.
       streamMapEntries(resUsage->inOutUsage.gs.builtInOutLocs, stream);
+    } else if (stage == ShaderStageMesh) {
+      // NOTE: For mesh shader, those two special map info (from built-in IDs to export locations of vertex/primitive
+      // attributes) is used to export vertex/primitive attributes.
+      streamMapEntries(resUsage->inOutUsage.mesh.builtInExportLocs, stream);
+      streamMapEntries(resUsage->inOutUsage.mesh.perPrimitiveBuiltInExportLocs, stream);
     }
 
     // Store the result of the hash for this shader stage.
@@ -157,12 +166,14 @@ bool PatchCheckShaderCache::runImpl(Module &module, PipelineState *pipelineState
   if (stagesLeftToCompile == stageMask)
     return false;
 
-  // "Remove" a shader stage by making its entry-point function internal and not DLLExport, so it gets removed later.
+  // "Remove" a shader stage by making its entry-point function an external but not DLLExport declaration, so further
+  // passes no longer treat it as an entry point (based on the DLL storage class) and don't attempt to compile any code
+  // for it (because it contains no code).
   for (auto &func : module) {
     if (isShaderEntryPoint(&func)) {
       auto stage = getShaderStage(&func);
       if (stage != ShaderStageInvalid && (shaderStageToMask(stage) & ~stagesLeftToCompile) != 0) {
-        func.setLinkage(GlobalValue::InternalLinkage);
+        func.deleteBody();
         func.setDLLStorageClass(GlobalValue::DefaultStorageClass);
       }
     }

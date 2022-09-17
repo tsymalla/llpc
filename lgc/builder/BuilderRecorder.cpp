@@ -96,6 +96,8 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
     return "log";
   case Sqrt:
     return "sqrt";
+  case InverseSqrt:
+    return "inverse.sqrt";
   case SAbs:
     return "sabs";
   case FSign:
@@ -168,6 +170,8 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
     return "write.generic.output";
   case Opcode::WriteXfbOutput:
     return "write.xfb.output";
+  case Opcode::ReadBaryCoord:
+    return "read.bary.coord";
   case Opcode::ReadBuiltInInput:
     return "read.builtin.input";
   case Opcode::ReadBuiltInOutput:
@@ -178,6 +182,10 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
     return "read.task.payload";
   case Opcode::WriteTaskPayload:
     return "write.task.payload";
+  case Opcode::TaskPayloadAtomic:
+    return "task.payload.atomic";
+  case Opcode::TaskPayloadAtomicCompareSwap:
+    return "task.payload.compare.swap";
   case Opcode::TransposeMatrix:
     return "transpose.matrix";
   case Opcode::MatrixTimesScalar:
@@ -238,8 +246,13 @@ StringRef BuilderRecorder::getCallName(Opcode opcode) {
     return "image.query.size";
   case Opcode::ImageGetLod:
     return "image.get.lod";
+#if VKI_RAY_TRACING
+  case Opcode::ImageBvhIntersectRayAMD:
+    return "image.bvh.intersect.ray";
+#else
   case Opcode::Reserved1:
     return "reserved1";
+#endif
   case GetWaveSize:
     return "get.wave.size";
   case GetSubgroupSize:
@@ -644,6 +657,15 @@ Value *BuilderRecorder::CreateLog(Value *x, const Twine &instName) {
 // @param instName : Name to give final instruction
 Value *BuilderRecorder::CreateSqrt(Value *x, const Twine &instName) {
   return record(Sqrt, x->getType(), x, instName);
+}
+
+// =====================================================================================================================
+// Create inverse square root operation
+//
+// @param x : Input value X
+// @param instName : Name to give final instruction
+Value *BuilderRecorder::CreateInverseSqrt(Value *x, const Twine &instName) {
+  return record(InverseSqrt, x->getType(), x, instName);
 }
 
 // =====================================================================================================================
@@ -1070,30 +1092,37 @@ Value *BuilderRecorder::CreateLoadBufferDesc(unsigned descSet, unsigned binding,
 // =====================================================================================================================
 // Create a get of the stride (in bytes) of a descriptor. Returns an i32 value.
 //
-// @param descType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+// @param concreteType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+//                   DescriptorTexelBuffer, DescriptorFmask.
+// @param abstractType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
 //                   DescriptorTexelBuffer, DescriptorFmask.
 // @param descSet : Descriptor set
 // @param binding : Descriptor binding
 // @param instName : Name to give instruction(s)
-Value *BuilderRecorder::CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                            const Twine &instName) {
+Value *BuilderRecorder::CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType,
+                                            unsigned descSet, unsigned binding, const Twine &instName) {
   return record(Opcode::GetDescStride, getInt32Ty(),
-                {getInt32(static_cast<unsigned>(descType)), getInt32(descSet), getInt32(binding)}, instName);
+                {getInt32(static_cast<unsigned>(concreteType)), getInt32(static_cast<unsigned>(abstractType)),
+                 getInt32(descSet), getInt32(binding)},
+                instName);
 }
 
 // =====================================================================================================================
 // Create a pointer to a descriptor. Returns a value of the type returned by GetSamplerDescPtrTy, GetImageDescPtrTy,
 // GetTexelBufferDescPtrTy or GetFmaskDescPtrTy, depending on descType.
 //
-// @param descType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+// @param concreteType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
 //                   DescriptorTexelBuffer, DescriptorFmask.
+// @param abstractType : Descriptor type to find user resource nodes;
 // @param descSet : Descriptor set
 // @param binding : Descriptor binding
 // @param instName : Name to give instruction(s)
-Value *BuilderRecorder::CreateGetDescPtr(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                         const Twine &instName) {
-  return record(Opcode::GetDescPtr, getDescPtrTy(descType),
-                {getInt32(static_cast<unsigned>(descType)), getInt32(descSet), getInt32(binding)}, instName);
+Value *BuilderRecorder::CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                                         unsigned binding, const Twine &instName) {
+  return record(Opcode::GetDescPtr, getDescPtrTy(concreteType),
+                {getInt32(static_cast<unsigned>(concreteType)), getInt32(static_cast<unsigned>(abstractType)),
+                 getInt32(descSet), getInt32(binding)},
+                instName);
 }
 
 // =====================================================================================================================
@@ -1515,6 +1544,26 @@ Instruction *BuilderRecorder::CreateWriteXfbOutput(Value *valueToWrite, bool isB
 }
 
 // =====================================================================================================================
+// Create a read of barycoord input value.
+// The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
+//
+// @param builtIn : Built-in kind, BuiltInBaryCoord or BuiltInBaryCoordNoPerspKHR
+// @param inputInfo : Extra input info
+// @param auxInterpValue : Auxiliary value of interpolation
+// @param instName : Name to give instruction(s)
+llvm::Value *BuilderRecorder::CreateReadBaryCoord(BuiltInKind builtIn, InOutInfo inputInfo, llvm::Value *auxInterpValue,
+                                                  const llvm::Twine &instName) {
+  Type *resultTy = getBuiltInTy(builtIn, inputInfo);
+  return record(Opcode::ReadBaryCoord, resultTy,
+                {
+                    getInt32(builtIn),
+                    getInt32(inputInfo.getData()),
+                    auxInterpValue ? auxInterpValue : PoisonValue::get(getInt32Ty()),
+                },
+                instName);
+}
+
+// =====================================================================================================================
 // Create a read of (part of) a built-in input value.
 // The type of the returned value is the fixed type of the specified built-in (see BuiltInDefs.h),
 // or the element type if pIndex is not nullptr.
@@ -1594,6 +1643,24 @@ Instruction *BuilderRecorder::CreateWriteBuiltInOutput(Value *valueToWrite, Buil
                 "");
 }
 
+#if VKI_RAY_TRACING
+// =====================================================================================================================
+// Create a ray intersect result with specified node in BVH buffer
+//
+// @param nodePtr : BVH node pointer
+// @param extent : The valid range on which intersections can occur
+// @param origin : Intersect ray origin
+// @param direction : Intersect ray direction
+// @param invDirection : The inverse of direction
+// @param imageDesc : Image descriptor
+// @param instName : Name to give instruction(s)
+Value *BuilderRecorder::CreateImageBvhIntersectRay(Value *nodePtr, Value *extent, Value *origin, Value *direction,
+                                                   Value *invDirection, Value *imageDesc, const Twine &instName) {
+  return record(Opcode::ImageBvhIntersectRayAMD, FixedVectorType::get(getInt32Ty(), 4),
+                {nodePtr, extent, origin, direction, invDirection, imageDesc}, instName);
+}
+
+#endif
 // =====================================================================================================================
 // Create a read from (part of) a task payload.
 // The result type is as specified by resultTy, a scalar or vector type with no more than four elements.
@@ -1601,7 +1668,7 @@ Instruction *BuilderRecorder::CreateWriteBuiltInOutput(Value *valueToWrite, Buil
 // @param resultTy : Type of value to read
 // @param byteOffset : Byte offset within the payload structure
 // @param instName : Name to give instruction(s)
-// @returns Value read from the task payload
+// @returns : Value read from the task payload
 Value *BuilderRecorder::CreateReadTaskPayload(Type *resultTy, Value *byteOffset, const Twine &instName) {
   return record(Opcode::ReadTaskPayload, resultTy, byteOffset, instName);
 }
@@ -1612,9 +1679,41 @@ Value *BuilderRecorder::CreateReadTaskPayload(Type *resultTy, Value *byteOffset,
 // @param valueToWrite : Value to write
 // @param byteOffset : Byte offset within the payload structure
 // @param instName : Name to give instruction(s)
-// @returns Instruction to write value to task payload
+// @returns : Instruction to write value to task payload
 Instruction *BuilderRecorder::CreateWriteTaskPayload(Value *valueToWrite, Value *byteOffset, const Twine &instName) {
   return record(Opcode::WriteTaskPayload, nullptr, {valueToWrite, byteOffset}, instName);
+}
+
+// =====================================================================================================================
+// Create a task payload atomic operation other than compare-and-swap. An add of +1 or -1, or a sub
+// of -1 or +1, is generated as inc or dec. Result type is the same as the input value type.
+//
+// @param atomicOp : Atomic op to create
+// @param ordering : Atomic ordering
+// @param inputValue : Input value
+// @param byteOffset : Byte offset within the payload structure
+// @param instName : Name to give instruction(s)
+// @returns : Original value read from the task payload
+Value *BuilderRecorder::CreateTaskPayloadAtomic(unsigned atomicOp, AtomicOrdering ordering, Value *inputValue,
+                                                Value *byteOffset, const Twine &instName) {
+  return record(Opcode::TaskPayloadAtomic, inputValue->getType(),
+                {getInt32(atomicOp), getInt32(static_cast<unsigned>(ordering)), inputValue, byteOffset}, instName);
+}
+
+// =====================================================================================================================
+// Create a task payload atomic compare-and-swap.
+//
+// @param ordering : Atomic ordering
+// @param inputValue : Input value
+// @param comparatorValue : Value to compare against
+// @param byteOffset : Byte offset within the payload structure
+// @param instName : Name to give instruction(s)
+// @returns : Original value read from the task payload
+Value *BuilderRecorder::CreateTaskPayloadAtomicCompareSwap(AtomicOrdering ordering, Value *inputValue,
+                                                           Value *comparatorValue, Value *byteOffset,
+                                                           const Twine &instName) {
+  return record(Opcode::TaskPayloadAtomicCompareSwap, inputValue->getType(),
+                {getInt32(static_cast<unsigned>(ordering)), inputValue, comparatorValue, byteOffset}, instName);
 }
 
 // =====================================================================================================================
@@ -1990,6 +2089,7 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Determinant:
     case Exp:
     case Sqrt:
+    case InverseSqrt:
     case Log:
     case MatrixInverse:
     case Opcode::CrossProduct:
@@ -2059,6 +2159,7 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::ImageSampleConvert:
     case Opcode::LoadBufferDesc:
     case Opcode::LoadPushConstantsPtr:
+    case Opcode::ReadBaryCoord:
     case Opcode::ReadBuiltInInput:
     case Opcode::ReadBuiltInOutput:
     case Opcode::ReadGenericInput:
@@ -2078,6 +2179,8 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::ImageAtomicCompareSwap:
     case Opcode::WriteXfbOutput:
     case Opcode::WriteTaskPayload:
+    case Opcode::TaskPayloadAtomic:
+    case Opcode::TaskPayloadAtomicCompareSwap:
       // Functions that read and write memory.
       break;
     case Opcode::SubgroupAll:
@@ -2123,6 +2226,9 @@ Instruction *BuilderRecorder::record(BuilderRecorder::Opcode opcode, Type *resul
     case Opcode::ReadClock:
     case Opcode::WriteBuiltInOutput:
     case Opcode::WriteGenericOutput:
+#if VKI_RAY_TRACING
+    case Opcode::ImageBvhIntersectRayAMD:
+#endif
       // TODO: These functions have not been classified yet.
       break;
     default:

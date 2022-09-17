@@ -4,7 +4,7 @@ LLPC can be built into a standalone offline compiler (amdllpc). It supports GLSL
 
 ## Build instructions
 
-LLPC is normally built as part of the [AMD Open Source Driver for Vulkan](https://github.com/GPUOpen-Drivers/AMDVLK/blob/dev/README.md). The building includes standalone `lgc` and `amdllpc` (**Note:** You need to add the option `-DXGL_BUILD_TOOLS=ON` in the AMDVLK cmake command before building `amdllpc`).
+LLPC is normally built as part of the [AMD Open Source Driver for Vulkan](https://github.com/GPUOpen-Drivers/AMDVLK/blob/dev/README.md). The build includes standalone `lgc` and `amdllpc` (**Note:** You need to add the option `-DXGL_BUILD_TOOLS=ON` in the AMDVLK cmake command before building `amdllpc`).
 You can build `lgc amdllpc` only or build `check-lgc check-lgc-units check-amdllpc check-amdllpc-units` to run local tests besides the build (**Note:** You need to add the option `-DXGL_BUILD_TESTS=ON` in the AMDVLK cmake command before building these local test targets).
 ```
 cmake --build xgl/builds/Release64 --target lgc amdllpc
@@ -55,7 +55,9 @@ cmake --build build --target check-lgc check-lgc-units check-amdllpc check-amdll
 ```
 
 See above if this gives an error due to not finding an include file from glslang or SPIRV-Tools.
-If you want to make amdllpc compatible with driver, you could get `<pal_interface_version>` from the `ICD_PAL_CLIENT_MAJOR_VERSION` defined in `xgl/icd/make/importdefs` and add it in the build option. If the build option is not added, the latest PAL interface version will be used.
+If you want to make amdllpc compatible with driver, you could get `<pal_interface_version>` from the
+`ICD_PAL_CLIENT_MAJOR_VERSION` defined in `xgl/cmake/XglVersions.cmake` and add it in the build option.
+If the build option is not added, the latest PAL interface version will be used.
 
 ## Usage
 ```

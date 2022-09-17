@@ -68,20 +68,30 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
   const ResourceNode *node = nullptr;
   if (!m_pipelineState->isUnlinked() || !m_pipelineState->getUserDataNodes().empty()) {
     // We have the user data layout. Find the node.
-    std::tie(topNode, node) = m_pipelineState->findResourceNode(ResourceNodeType::DescriptorBuffer, descSet, binding);
+    ResourceNodeType abstractType = DescriptorAnyBuffer;
+    if (flags & BufferFlagConst)
+      abstractType = ResourceNodeType::DescriptorConstBuffer;
+    else if (flags & BufferFlagNonConst)
+      abstractType = ResourceNodeType::DescriptorBuffer;
+    else if (flags & BufferFlagShaderResource)
+      abstractType = ResourceNodeType::DescriptorResource;
+    else if (flags & BufferFlagSampler)
+      abstractType = ResourceNodeType::DescriptorSampler;
+
+    std::tie(topNode, node) = m_pipelineState->findResourceNode(abstractType, descSet, binding);
     if (!node) {
       // We did not find the resource node. Return an undef value.
       return UndefValue::get(getBufferDescTy(pointeeTy));
     }
 
-    if (node == topNode && isa<Constant>(descIndex) && node->type != ResourceNodeType::InlineBuffer) {
+    if (node == topNode && isa<Constant>(descIndex) && node->concreteType != ResourceNodeType::InlineBuffer) {
       // Handle a descriptor in the root table (a "dynamic descriptor") specially, as long as it is not variably
       // indexed and is not an InlineBuffer. This lgc.root.descriptor call is by default lowered in
       // PatchEntryPointMutate into a load from the spill table, but it might be able to "unspill" it to
       // directly use shader entry SGPRs.
       // TODO: Handle root InlineBuffer specially in a similar way to PushConst. The default handling is
       // suboptimal as it always loads from the spill table.
-      Type *descTy = getDescTy(node->type);
+      Type *descTy = getDescTy(node->concreteType);
       std::string callName = lgcName::RootDescriptor;
       addTypeMangling(descTy, {}, callName);
       unsigned dwordSize = descTy->getPrimitiveSizeInBits() / 32;
@@ -94,9 +104,9 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
         dwordOffset += (binding - node->binding) * node->stride;
         desc = CreateNamedCall(callName, descTy, getInt32(dwordOffset), Attribute::ReadNone);
       }
-    } else if (node->type == ResourceNodeType::InlineBuffer) {
+    } else if (node->concreteType == ResourceNodeType::InlineBuffer) {
       // Handle an inline buffer specially. Get a pointer to it, then expand to a descriptor.
-      Value *descPtr = getDescPtr(node->type, descSet, binding, topNode, node);
+      Value *descPtr = getDescPtr(node->concreteType, node->abstractType, descSet, binding, topNode, node);
       desc = buildInlineBufferDesc(descPtr);
     }
   }
@@ -104,8 +114,11 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
   if (!desc) {
     // Not handled by either of the special cases above...
     // Get a pointer to the descriptor, as a pointer to i8.
-    ResourceNodeType resType = node ? node->type : ResourceNodeType::DescriptorBuffer;
-    Value *descPtr = getDescPtr(resType, descSet, binding, topNode, node);
+    // For shader compilation with no user data layout provided, we assume we want a DescriptorBuffer, as
+    // DescriptorConstBuffer is not used in that case.
+    ResourceNodeType resType = node ? node->concreteType : ResourceNodeType::DescriptorBuffer;
+    ResourceNodeType abstractType = node ? node->abstractType : resType;
+    Value *descPtr = getDescPtr(resType, abstractType, descSet, binding, topNode, node);
     // Index it.
     if (descIndex != getInt32(0)) {
       descIndex = CreateMul(descIndex, getStride(resType, descSet, binding, node));
@@ -119,7 +132,9 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
 
   // If it is a compact buffer descriptor, expand it. (That can only happen when user data layout is available;
   // compact buffer descriptors are disallowed when using shader compilation with no user data layout).
-  if (node && node->type == ResourceNodeType::DescriptorBufferCompact)
+  if (node && node->concreteType == ResourceNodeType::DescriptorBufferCompact)
+    desc = buildBufferCompactDesc(desc);
+  else if (node && node->concreteType == ResourceNodeType::DescriptorConstBufferCompact)
     desc = buildBufferCompactDesc(desc);
 
   if (!instName.isTriviallyEmpty())
@@ -134,52 +149,55 @@ Value *DescBuilder::CreateLoadBufferDesc(unsigned descSet, unsigned binding, Val
 // =====================================================================================================================
 // Create a get of the stride (in bytes) of a descriptor. Returns an i32 value.
 //
-// @param descType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+// @param concreteType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+//                   DescriptorTexelBuffer, DescriptorFmask.
+// @param abstractType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
 //                   DescriptorTexelBuffer, DescriptorFmask.
 // @param descSet : Descriptor set
 // @param binding : Descriptor binding
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::CreateGetDescStride(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                        const Twine &instName) {
+Value *DescBuilder::CreateGetDescStride(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                                        unsigned binding, const Twine &instName) {
   // Find the descriptor node. If doing a shader compilation with no user data layout provided, don't bother to
   // look; we will use relocs instead.
   const ResourceNode *topNode = nullptr;
   const ResourceNode *node = nullptr;
   if (!m_pipelineState->isUnlinked() || !m_pipelineState->getUserDataNodes().empty()) {
-    std::tie(topNode, node) = m_pipelineState->findResourceNode(descType, descSet, binding);
+    std::tie(topNode, node) = m_pipelineState->findResourceNode(abstractType, descSet, binding);
     if (!node) {
       // We did not find the resource node. Return an undef value.
       return UndefValue::get(getInt32Ty());
     }
   }
-  return getStride(descType, descSet, binding, node);
+  return getStride(concreteType, descSet, binding, node);
 }
 
 // =====================================================================================================================
 // Create a pointer to a descriptor. Returns a value of the type returned by GetSamplerDescPtrTy, GetImageDescPtrTy,
 // GetTexelBufferDescPtrTy or GetFmaskDescPtrTy, depending on descType.
 //
-// @param descType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
+// @param concreteType : Descriptor type, one of ResourceNodeType::DescriptorSampler, DescriptorResource,
 //                   DescriptorTexelBuffer, DescriptorFmask.
+// @param abstractType : Descriptor type to find user resource nodes;
 // @param descSet : Descriptor set
 // @param binding : Descriptor binding
 // @param instName : Name to give instruction(s)
-Value *DescBuilder::CreateGetDescPtr(ResourceNodeType descType, unsigned descSet, unsigned binding,
-                                     const Twine &instName) {
+Value *DescBuilder::CreateGetDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                                     unsigned binding, const Twine &instName) {
   // Find the descriptor node. If doing a shader compilation with no user data layout provided, don't bother to
   // look; we will use relocs instead.
   const ResourceNode *topNode = nullptr;
   const ResourceNode *node = nullptr;
   if (!m_pipelineState->isUnlinked() || !m_pipelineState->getUserDataNodes().empty()) {
-    std::tie(topNode, node) = m_pipelineState->findResourceNode(descType, descSet, binding);
+    std::tie(topNode, node) = m_pipelineState->findResourceNode(abstractType, descSet, binding);
     if (!node) {
       // We did not find the resource node. Return an undef value.
-      return UndefValue::get(getDescPtrTy(descType));
+      return UndefValue::get(getDescPtrTy(concreteType));
     }
   }
 
   Value *descPtr = nullptr;
-  if (node && node->immutableSize != 0 && descType == ResourceNodeType::DescriptorSampler) {
+  if (node && node->immutableSize != 0 && concreteType == ResourceNodeType::DescriptorSampler) {
     // This is an immutable sampler. Put the immutable value into a static variable and return a pointer
     // to that. For a simple non-variably-indexed immutable sampler not passed through a function call
     // or phi node, we rely on subsequent LLVM optimizations promoting the value back to a constant.
@@ -207,11 +225,11 @@ Value *DescBuilder::CreateGetDescPtr(ResourceNodeType descType, unsigned descSet
     }
   } else {
     // Get a pointer to the descriptor.
-    descPtr = getDescPtr(descType, descSet, binding, topNode, node);
+    descPtr = getDescPtr(concreteType, abstractType, descSet, binding, topNode, node);
   }
 
   // Cast to the right pointer type.
-  return CreateBitCast(descPtr, getDescPtrTy(descType));
+  return CreateBitCast(descPtr, getDescPtrTy(concreteType));
 }
 
 // =====================================================================================================================
@@ -227,9 +245,11 @@ Value *DescBuilder::CreateLoadPushConstantsPtr(Type *returnTy, const Twine &inst
     // Push const is the sub node of DescriptorTableVaPtr.
     if (m_pipelineState->getUserDataNodes().empty()) {
       Value *highHalf = getInt32(HighAddrPc);
-      Value *descPtr = CreateNamedCall(
-          lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
-          {getInt32(unsigned(ResourceNodeType::PushConst)), getInt32(-1), getInt32(0), highHalf}, Attribute::ReadNone);
+      Value *descPtr =
+          CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
+                          {getInt32(unsigned(ResourceNodeType::PushConst)),
+                           getInt32(unsigned(ResourceNodeType::PushConst)), getInt32(-1), getInt32(0), highHalf},
+                          Attribute::ReadNone);
       return CreateBitCast(descPtr, returnTy);
     }
 
@@ -237,10 +257,11 @@ Value *DescBuilder::CreateLoadPushConstantsPtr(Type *returnTy, const Twine &inst
     assert(topNode);
     const ResourceNode subNode = topNode->innerTable[0];
     Value *highHalf = getInt32(HighAddrPc);
-    Value *descPtr = CreateNamedCall(
-        lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
-        {getInt32(unsigned(ResourceNodeType::PushConst)), getInt32(subNode.set), getInt32(subNode.binding), highHalf},
-        Attribute::ReadNone);
+    Value *descPtr = CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
+                                     {getInt32(unsigned(ResourceNodeType::PushConst)),
+                                      getInt32(unsigned(ResourceNodeType::PushConst)), getInt32(subNode.set),
+                                      getInt32(subNode.binding), highHalf},
+                                     Attribute::ReadNone);
     return CreateBitCast(descPtr, returnTy);
   }
   // Get the push const pointer. If subsequent code only uses this with constant GEPs and loads,
@@ -301,13 +322,14 @@ static StringRef GetRelocTypeSuffix(ResourceNodeType type) {
 // =====================================================================================================================
 // Get a pointer to a descriptor, as a pointer to i8
 //
-// @param resType : Resource type
+// @param concreteType : Concrete resource type
+// @param abstractType : Abstract Resource type
 // @param descSet : Descriptor set
 // @param binding : Binding
 // @param topNode : Node in top-level descriptor table (nullptr for shader compilation)
 // @param node : The descriptor node itself (nullptr for shader compilation)
-Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsigned binding,
-                               const ResourceNode *topNode, const ResourceNode *node) {
+Value *DescBuilder::getDescPtr(ResourceNodeType concreteType, ResourceNodeType abstractType, unsigned descSet,
+                               unsigned binding, const ResourceNode *topNode, const ResourceNode *node) {
   Value *descPtr = nullptr;
 
   auto GetSpillTablePtr = [this]() {
@@ -317,7 +339,7 @@ Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsig
     return CreateNamedCall(lgcName::SpillTable, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST), {}, Attribute::ReadNone);
   };
 
-  auto GetDescriptorSetPtr = [this, node, topNode, resType, descSet, binding]() -> Value * {
+  auto GetDescriptorSetPtr = [this, node, topNode, concreteType, abstractType, descSet, binding]() -> Value * {
     // Get the descriptor table pointer for the descriptor at the given set and binding, which might be passed as a
     // user SGPR to the shader.
     // The args to the lgc.descriptor.table.addr call are:
@@ -325,13 +347,14 @@ Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsig
     // - descriptor set number
     // - descriptor binding number
     // - value for high 32 bits of the pointer; HighAddrPc to use PC
-    if (node || topNode || resType != ResourceNodeType::DescriptorFmask) {
+    if (node || topNode || concreteType != ResourceNodeType::DescriptorFmask) {
       unsigned shadowDescriptorTable = m_pipelineState->getOptions().shadowDescriptorTable;
       bool shadow =
-          resType == ResourceNodeType::DescriptorFmask && shadowDescriptorTable != ShadowDescriptorTableDisable;
+          concreteType == ResourceNodeType::DescriptorFmask && shadowDescriptorTable != ShadowDescriptorTableDisable;
       Value *highHalf = getInt32(shadow ? shadowDescriptorTable : HighAddrPc);
       return CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
-                             {getInt32(unsigned(resType)), getInt32(descSet), getInt32(binding), highHalf},
+                             {getInt32(unsigned(concreteType)), getInt32(unsigned(abstractType)), getInt32(descSet),
+                              getInt32(binding), highHalf},
                              Attribute::ReadNone);
     }
     // This should be an unlinked shader, and we will use a relocation for the high half of the address.
@@ -339,22 +362,22 @@ Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsig
            "Cannot add shadow descriptor relocations unless building an unlinked shader.");
 
     // Get the address when the shadow table is disabled.
-    Value *nonShadowAddr = CreateNamedCall(
-        lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
-        {getInt32(unsigned(resType)), getInt32(descSet), getInt32(binding), getInt32(HighAddrPc)}, Attribute::ReadNone);
+    Value *nonShadowAddr = CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
+                                           {getInt32(unsigned(concreteType)), getInt32(unsigned(abstractType)),
+                                            getInt32(descSet), getInt32(binding), getInt32(HighAddrPc)},
+                                           Attribute::ReadNone);
 
     // Get the address using a relocation when the shadow table is enabled.
     Value *shadowDescriptorReloc = CreateRelocationConstant(reloc::ShadowDescriptorTable);
-    Value *shadowAddr =
-        CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
-                        {getInt32(unsigned(resType)), getInt32(descSet), getInt32(binding), shadowDescriptorReloc},
-                        Attribute::ReadNone);
+    Value *shadowAddr = CreateNamedCall(lgcName::DescriptorTableAddr, getInt8Ty()->getPointerTo(ADDR_SPACE_CONST),
+                                        {getInt32(unsigned(concreteType)), getInt32(unsigned(abstractType)),
+                                         getInt32(descSet), getInt32(binding), shadowDescriptorReloc},
+                                        Attribute::ReadNone);
 
     // Use a relocation to select between the two.
     Value *useShadowReloc = CreateRelocationConstant(reloc::ShadowDescriptorTableEnabled);
     Value *useShadowTable = CreateICmpNE(useShadowReloc, getInt32(0));
     return CreateSelect(useShadowTable, shadowAddr, nonShadowAddr);
-
   };
 
   // Get the descriptor table pointer.
@@ -362,7 +385,7 @@ Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsig
     // Ensure we mark spill table usage.
     descPtr = GetSpillTablePtr();
     getPipelineState()->getPalMetadata()->setUserDataSpillUsage(node->offsetInDwords);
-  } else if (!node && !topNode && resType == ResourceNodeType::DescriptorBuffer) {
+  } else if (!node && !topNode && concreteType == ResourceNodeType::DescriptorBuffer) {
     // If we do not have user data layout info (topNode and node are nullptr), then
     // we do not know at compile time whether a DescriptorBuffer is in the root table or the table for its
     // descriptor set, so we need to generate a select between the two, where the condition is a reloc.
@@ -398,7 +421,7 @@ Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsig
     // reloc symbol name needs to contain the descriptor set and binding, and, for image, fmask or sampler,
     // whether it is a sampler.
     offset = CreateRelocationConstant(reloc::DescriptorOffset + Twine(descSet) + "_" + Twine(binding) +
-                                      GetRelocTypeSuffix(resType));
+                                      GetRelocTypeSuffix(concreteType));
   } else {
     // Get the offset for the descriptor. Where we are getting the second part of a combined resource,
     // add on the size of the first part.
@@ -406,7 +429,8 @@ Value *DescBuilder::getDescPtr(ResourceNodeType resType, unsigned descSet, unsig
     offsetInDwords += (binding - node->binding) * node->stride;
 
     unsigned offsetInBytes = offsetInDwords * 4;
-    if (resType == ResourceNodeType::DescriptorSampler && node->type == ResourceNodeType::DescriptorCombinedTexture)
+    if (concreteType == ResourceNodeType::DescriptorSampler &&
+        node->concreteType == ResourceNodeType::DescriptorCombinedTexture)
       offsetInBytes += DescriptorSizeResource;
     offset = getInt32(offsetInBytes);
   }

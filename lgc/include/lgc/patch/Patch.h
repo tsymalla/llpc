@@ -62,6 +62,7 @@ void initializeLegacyPatchSetupTargetFeaturesPass(PassRegistry &);
 void initializeLegacyPatchWorkaroundsPass(PassRegistry &);
 void initializeLegacyPatchReadFirstLanePass(PassRegistry &);
 void initializeLegacyPatchWaveSizeAdjustPass(PassRegistry &);
+void initializeLegacyPatchImageDerivativesPass(PassRegistry &);
 void initializeLegacyPatchInitializeWorkgroupMemoryPass(PassRegistry &);
 } // namespace llvm
 
@@ -91,6 +92,7 @@ inline void initializePatchPasses(llvm::PassRegistry &passRegistry) {
   initializeLegacyPatchWorkaroundsPass(passRegistry);
   initializeLegacyPatchReadFirstLanePass(passRegistry);
   initializeLegacyPatchWaveSizeAdjustPass(passRegistry);
+  initializeLegacyPatchImageDerivativesPass(passRegistry);
   initializeLegacyPatchInitializeWorkgroupMemoryPass(passRegistry);
 }
 
@@ -106,12 +108,13 @@ llvm::FunctionPass *createLegacyPatchLoadScalarizer();
 llvm::LoopPass *createLegacyPatchLoopMetadata();
 llvm::ModulePass *createLegacyPatchNullFragShader();
 llvm::FunctionPass *createLegacyPatchPeepholeOpt();
-llvm::ModulePass *createLegacyPatchPreparePipelineAbi(bool onlySetCallingConvs);
+llvm::ModulePass *createLegacyPatchPreparePipelineAbi();
 llvm::ModulePass *createLegacyPatchResourceCollect();
 llvm::ModulePass *createLegacyPatchSetupTargetFeatures();
 llvm::ModulePass *createLegacyPatchWorkarounds();
 llvm::FunctionPass *createLegacyPatchReadFirstLane();
 llvm::ModulePass *createLegacyPatchWaveSizeAdjust();
+llvm::ModulePass *createLegacyPatchImageDerivatives();
 llvm::ModulePass *createLegacyPatchInitializeWorkgroupMemory();
 class PipelineState;
 class PassManager;

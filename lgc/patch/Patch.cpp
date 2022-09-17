@@ -38,6 +38,7 @@
 #include "lgc/patch/PatchCheckShaderCache.h"
 #include "lgc/patch/PatchCopyShader.h"
 #include "lgc/patch/PatchEntryPointMutate.h"
+#include "lgc/patch/PatchImageDerivatives.h"
 #include "lgc/patch/PatchImageOpCollect.h"
 #include "lgc/patch/PatchInOutImportExport.h"
 #include "lgc/patch/PatchInitializeWorkgroupMemory.h"
@@ -124,74 +125,49 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
                                     "// LLPC pipeline before-patching results\n"));
   }
 
-  // Build null fragment shader if necessary
-  passMgr.addPass(PatchNullFragShader());
-
-  // Patch resource collecting, remove inactive resources (should be the first preliminary pass)
-  passMgr.addPass(PatchResourceCollect());
-
-  // Patch wave size adjusting heuristic
-  passMgr.addPass(PatchWaveSizeAdjust());
-
-  // Patch workarounds
-  passMgr.addPass(PatchWorkarounds());
-
-  // Generate copy shader if necessary.
-  passMgr.addPass(PatchCopyShader());
-
-  // Lower vertex fetch operations.
-  passMgr.addPass(LowerVertexFetch());
-
-  // Lower fragment export operations.
-  passMgr.addPass(LowerFragColorExport());
-
-  // Run IPSCCP before EntryPointMutate to avoid adding unnecessary arguments to an entry point.
   passMgr.addPass(IPSCCPPass());
 
-  // Patch entry-point mutation (should be done before external library link)
+  passMgr.addPass(PatchNullFragShader());
+  passMgr.addPass(PatchResourceCollect()); // also removes inactive/unused resources
+
+  // PatchCheckShaderCache depends on PatchResourceCollect
+  passMgr.addPass(PatchCheckShaderCache(std::move(checkShaderCacheFunc)));
+
+  // First part of lowering to "AMDGCN-style"
+  passMgr.addPass(PatchWaveSizeAdjust());
+  passMgr.addPass(PatchWorkarounds());
+  passMgr.addPass(PatchCopyShader());
+  passMgr.addPass(LowerVertexFetch());
+  passMgr.addPass(LowerFragColorExport());
   passMgr.addPass(PatchEntryPointMutate());
-
-  // Patch workgroup memory initializaion.
   passMgr.addPass(PatchInitializeWorkgroupMemory());
-
-  // Patch input import and output export operations
   passMgr.addPass(PatchInOutImportExport());
 
-  // Prior to general optimization, do function inlining and dead function removal
+  // Prior to general optimization, do function inlining and dead function removal to remove helper functions that
+  // were introduced during lowering (e.g. streamout stores).
   passMgr.addPass(AlwaysInlinerPass());
   passMgr.addPass(GlobalDCEPass());
 
-  // Patch loop metadata
   passMgr.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(PatchLoopMetadata())));
 
-  // Check shader cache
-  passMgr.addPass(PatchCheckShaderCache(std::move(checkShaderCacheFunc)));
-
-  // Stop timer for patching passes and start timer for optimization passes.
   if (patchTimer) {
     LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, false);
     LgcContext::createAndAddStartStopTimer(passMgr, optTimer, true);
   }
 
-  // Prepare pipeline ABI but only set the calling conventions to AMDGPU ones for now.
-  passMgr.addPass(PatchPreparePipelineAbi(/* onlySetCallingConvs = */ true));
-
-  // Add some optimization passes
   addOptimizationPasses(passMgr, optLevel);
 
-  // Stop timer for optimization passes and restart timer for patching passes.
   if (patchTimer) {
     LgcContext::createAndAddStartStopTimer(passMgr, optTimer, false);
     LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, true);
   }
 
-  // Fully prepare the pipeline ABI (must be after optimizations)
-  passMgr.addPass(PatchPreparePipelineAbi(/* onlySetCallingConvs = */ false));
+  // Second part of lowering to "AMDGCN-style"
+  passMgr.addPass(PatchPreparePipelineAbi());
 
   const bool canUseNgg = pipelineState->isGraphics() && pipelineState->getTargetInfo().getGfxIpVersion().major == 10 &&
                          (pipelineState->getOptions().nggFlags & NggFlagDisable) == 0;
   if (canUseNgg) {
-    // Stop timer for patching passes and restart timer for optimization passes.
     if (patchTimer) {
       LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, false);
       LgcContext::createAndAddStartStopTimer(passMgr, optTimer, true);
@@ -208,7 +184,6 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
     fpm.addPass(SimplifyCFGPass());
     passMgr.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
 
-    // Stop timer for optimization passes and restart timer for patching passes.
     if (patchTimer) {
       LgcContext::createAndAddStartStopTimer(passMgr, optTimer, false);
       LgcContext::createAndAddStartStopTimer(passMgr, patchTimer, true);
@@ -219,6 +194,8 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
     fpm.addPass(InstCombinePass(2));
     passMgr.addPass(createModuleToFunctionPassAdaptor(std::move(fpm)));
   }
+
+  passMgr.addPass(PatchImageDerivatives());
 
   // Set up target features in shader entry-points.
   // NOTE: Needs to be done after post-NGG function inlining, because LLVM refuses to inline something
@@ -308,7 +285,7 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
   // Patch entry-point mutation (should be done before external library link)
   passMgr.add(createLegacyPatchEntryPointMutate());
 
-  // Patch workgroup memory initializaion.
+  // Patch workgroup memory initialization.
   passMgr.add(createLegacyPatchInitializeWorkgroupMemory());
 
   // Patch input import and output export operations
@@ -332,9 +309,6 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
     passMgr.add(LgcContext::createStartStopTimer(optTimer, true));
   }
 
-  // Prepare pipeline ABI but only set the calling conventions to AMDGPU ones for now.
-  passMgr.add(createLegacyPatchPreparePipelineAbi(/* onlySetCallingConvs = */ true));
-
   // Add some optimization passes
   addOptimizationPasses(passMgr, optLevel);
 
@@ -349,7 +323,7 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
   passMgr.add(createInstructionCombiningPass(2));
 
   // Fully prepare the pipeline ABI (must be after optimizations)
-  passMgr.add(createLegacyPatchPreparePipelineAbi(/* onlySetCallingConvs = */ false));
+  passMgr.add(createLegacyPatchPreparePipelineAbi());
 
   const bool canUseNgg = pipelineState->isGraphics() && pipelineState->getTargetInfo().getGfxIpVersion().major == 10 &&
                          (pipelineState->getOptions().nggFlags & NggFlagDisable) == 0;
@@ -374,6 +348,8 @@ void LegacyPatch::addPasses(PipelineState *pipelineState, legacy::PassManager &p
       passMgr.add(LgcContext::createStartStopTimer(patchTimer, true));
     }
   }
+
+  passMgr.add(createLegacyPatchImageDerivatives());
 
   // Set up target features in shader entry-points.
   // NOTE: Needs to be done after post-NGG function inlining, because LLVM refuses to inline something

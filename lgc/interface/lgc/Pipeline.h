@@ -143,6 +143,9 @@ struct Options {
   unsigned pageMigrationEnabled;  // Enable page migration
   ResourceLayoutScheme resourceLayoutScheme; // Resource layout scheme
   ThreadGroupSwizzleMode threadGroupSwizzleMode; // Thread group swizzle mode
+  unsigned reverseThreadGroupBufferDescSet;      // Descriptor set ID of the internal buffer for reverse thread group
+                                                 // optimization
+  unsigned reverseThreadGroupBufferBinding; // Binding ID of the internal buffer for reverse thread group optimization
 };
 
 // Middle-end per-shader options to pass to SetShaderOptions.
@@ -217,6 +220,15 @@ struct ShaderOptions {
   // Attempt to scalarize waterfall descriptor loads.
   bool scalarizeWaterfallLoads;
 
+  /// Override value for ThreadGroupSizeX
+  unsigned overrideShaderThreadGroupSizeX;
+
+  /// Override value for ThreadGroupSizeY
+  unsigned overrideShaderThreadGroupSizeY;
+
+  /// Override value for ThreadGroupSizeZ
+  unsigned overrideShaderThreadGroupSizeZ;
+
   ShaderOptions() {
     // The memory representation of this struct gets written into LLVM metadata. To prevent uninitialized values from
     // being written, we force everything to 0, including alignment gaps.
@@ -241,9 +253,10 @@ struct ShaderOptions {
 struct ResourceNode {
   ResourceNode() {}
 
-  ResourceNodeType type;   // Type of this node
-  unsigned sizeInDwords;   // Size in dwords
-  unsigned offsetInDwords; // Offset in dwords
+  ResourceNodeType concreteType; // Underlying actual type of this node
+  ResourceNodeType abstractType; // Node type for resource node matching
+  unsigned sizeInDwords;         // Size in dwords
+  unsigned offsetInDwords;       // Offset in dwords
 
   union {
     // Info for generic descriptor nodes.

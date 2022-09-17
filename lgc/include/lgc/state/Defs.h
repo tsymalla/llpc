@@ -69,10 +69,18 @@ const static char ReconfigureLocalInvocationId[] = "lgc.reconfigure.local.invoca
 const static char SwizzleLocalInvocationId[] = "lgc.swizzle.local.invocation.id";
 const static char SwizzleWorkgroupId[] = "lgc.swizzle.workgroup.id";
 
+const static char MeshTaskCallPrefix[] = "lgc.mesh.task.";
 const static char MeshTaskReadTaskPayload[] = "lgc.mesh.task.read.task.payload";
 const static char MeshTaskWriteTaskPayload[] = "lgc.mesh.task.write.task.payload";
+const static char MeshTaskAtomicTaskPayload[] = "lgc.mesh.task.atomic.task.payload";
+const static char MeshTaskAtomicCompareSwapTaskPayload[] = "lgc.mesh.task.atomic.compare.swap.task.payload";
 const static char MeshTaskEmitMeshTasks[] = "lgc.mesh.task.emit.mesh.tasks";
 const static char MeshTaskSetMeshOutputs[] = "lgc.mesh.task.set.mesh.outputs";
+const static char MeshTaskSetPrimitiveIndices[] = "lgc.mesh.task.set.primitive.indices.";
+const static char MeshTaskSetPrimitiveCulled[] = "lgc.mesh.task.set.primitive.culled";
+const static char MeshTaskGetMeshInput[] = "lgc.mesh.task.get.mesh.input.";
+const static char MeshTaskWriteVertexOutput[] = "lgc.mesh.task.write.vertex.output.";
+const static char MeshTaskWritePrimitiveOutput[] = "lgc.mesh.task.write.primitive.output.";
 
 // Get pointer to spill table (as pointer to i8)
 const static char SpillTable[] = "lgc.spill.table";
@@ -152,6 +160,15 @@ static_assert(MaxGsStreams == MaxTransformFeedbackBuffers, "Unexpected value!");
 
 // Maximum tess factors per patch
 static const unsigned MaxTessFactorsPerPatch = 6; // 4 outer factors + 2 inner factors
+
+#if VKI_RAY_TRACING
+static const char RayQueryLdsStackName[] = "LdsStack";
+// NOTE: Currently, we restrict the max thread count of ray query to be 64 and make sure the wave size is 64. This is
+// because we don't provide the capability of querying thread ID in group for ray query in vertex processing shaders.
+// In the future, if such is done, we could consider to remove this restriction.
+static const unsigned MaxRayQueryThreadsPerGroup = 64; // Max number of ray query threads per group
+static const unsigned MaxRayQueryLdsStackEntries = 16; // Max number of ray query LDS stack entries
+#endif
 
 // Internal resource table's virtual descriptor sets
 static const unsigned InternalResourceTable = 0x10000000;

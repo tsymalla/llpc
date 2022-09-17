@@ -72,7 +72,7 @@ namespace lgc {
 // Enumerates the function of a particular node in a shader's resource mapping graph. Also used as descriptor
 // type in Builder descriptor functions.
 enum class ResourceNodeType : unsigned {
-  Unknown,                   ///< Invalid type
+  Unknown = 0,               ///< Invalid type
   DescriptorResource,        ///< Generic descriptor: resource, including texture resource, image, input
                              ///  attachment
   DescriptorSampler,         ///< Generic descriptor: sampler
@@ -88,10 +88,10 @@ enum class ResourceNodeType : unsigned {
   StreamOutTableVaPtr,       ///< Stream-out buffer table VA pointer
   DescriptorReserved12,
   DescriptorReserved13,
-  InlineBuffer, ///< Inline buffer, with descriptor set and binding
-  DescriptorReserved15,
-  DescriptorReserved16,
-  Count, ///< Count of resource mapping node types.
+  InlineBuffer,                 ///< Inline buffer, with descriptor set and binding
+  DescriptorConstBuffer,        ///< Generic descriptor: constant buffer
+  DescriptorConstBufferCompact, ///< Compact buffer descriptor, only contains the buffer address
+  Count,                        ///< Count of resource mapping node types.
 };
 
 // Represents mapping layout of the resources used in shaders

@@ -15,13 +15,11 @@ jobs:
       fail-fast: false
       matrix:
         host-os:             ["ubuntu-20.04"]
-        image-template:      ["gcr.io/stadia-open-source/amdvlk_%s%s:nightly"]
+        image-template:      ["us-docker.pkg.dev/stadia-open-source/amdvlk-public-ci/amdvlk_%s%s:nightly"]
         config:              [Release]
         feature-set:         ["+gcc", "+gcc+assertions",
                               "+clang", "+clang+coverage",
                               "+clang+shadercache+coverage+assertions",
-                              "+clang+shadercache+ubsan+asan",
-                              "+clang+shadercache+ubsan+asan+assertions",
                               "+clang+shadercache+tsan"]
     steps:
       - name: Free up disk space
