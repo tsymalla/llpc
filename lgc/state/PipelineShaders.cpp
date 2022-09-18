@@ -33,6 +33,7 @@
 #include "lgc/util/Internal.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
+#include "lgc/util/Debug.h"
 
 #define DEBUG_TYPE "lgc-pipeline-shaders"
 
@@ -91,9 +92,11 @@ PipelineShadersResult PipelineShaders::runImpl(Module &module) {
 
   for (auto &func : module) {
     if (isShaderEntryPoint(&func)) {
+      func.dump();
       auto shaderStage = lgc::getShaderStage(&func);
 
       if (shaderStage != ShaderStageInvalid) {
+        LLPC_OUTS("Regard as entry point.");
         result.m_entryPoints[shaderStage] = &func;
         result.m_entryPointMap[&func] = shaderStage;
       }

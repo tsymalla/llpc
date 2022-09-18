@@ -151,8 +151,11 @@ bool PatchResourceCollect::runImpl(Module &module, PipelineShadersResult &pipeli
   for (Function &func : module) {
     if (func.isDeclaration())
       continue;
+    outs() << "Processing function: ";
+    func.dump();
     m_shaderStage = getShaderStage(&func);
-    if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage))
+    // Skip non-inlined functions.
+    if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage) || func.hasFnAttribute(Attribute::NoInline))
       continue;
     m_entryPoint = &func;
     processShader();
@@ -1161,6 +1164,8 @@ void PatchResourceCollect::processShader() {
   clearInactiveBuiltInOutput();
 
   if (m_pipelineState->isGraphics()) {
+    LLPC_OUTS("Matching generic inputs / outputs for:");
+    m_entryPoint->dump();
     matchGenericInOut();
     mapBuiltInToGenericInOut();
   }

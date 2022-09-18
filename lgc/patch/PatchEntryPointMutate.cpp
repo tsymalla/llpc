@@ -54,6 +54,7 @@
  */
 
 #include "lgc/patch/PatchEntryPointMutate.h"
+#include "lgc/CommonDefs.h"
 #include "lgc/LgcContext.h"
 #include "lgc/patch/ShaderInputs.h"
 #include "lgc/state/AbiUnlinked.h"
@@ -65,9 +66,11 @@
 #include "lgc/util/AddressExtender.h"
 #include "lgc/util/BuilderBase.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "lgc/util/Debug.h"
 
 #define DEBUG_TYPE "lgc-patch-entry-point-mutate"
 
@@ -176,11 +179,13 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
       if (m_entryPoint) {
         m_shaderStage = static_cast<ShaderStage>(shaderStage);
         processShader(&shaderInputs);
+        processFuncs(&shaderInputs, module, m_shaderStage);
       }
     }
   } else {
-    processComputeFuncs(&shaderInputs, module);
+    processFuncs(&shaderInputs, module);
   }
+  
 
   // Fix up user data uses to use entry args.
   fixupUserDataUses(*m_module);
@@ -706,7 +711,10 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   }
 
   // Set Attributes on new function.
-  setFuncAttrs(entryPoint);
+  if (m_shaderStage == ShaderStageCompute) {
+    // Don't mess up function args for non-compute non-inlined functions.
+    setFuncAttrs(entryPoint);
+  }
 
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
@@ -717,8 +725,9 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
 //
 // @param shaderInputs : ShaderInputs object representing hardware-provided shader inputs
 // @param [in/out] module : Module
-void PatchEntryPointMutate::processComputeFuncs(ShaderInputs *shaderInputs, Module &module) {
-  m_shaderStage = ShaderStageCompute;
+void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage) {
+  m_shaderStage = shaderStage;
+
 
   // We no longer support compute shader fixed layout required before PAL interface version 624.
   if (m_pipelineState->getLgcContext()->getPalAbiVersion() < 624)
@@ -738,21 +747,27 @@ void PatchEntryPointMutate::processComputeFuncs(ShaderInputs *shaderInputs, Modu
   }
 
   for (Function *origFunc : origFuncs) {
+    LLPC_OUTS("Function before processFuncs");
+    origFunc->dump();
+
     auto *origType = origFunc->getFunctionType();
     // Determine what args need to be added on to all functions.
     SmallVector<Type *, 20> shaderInputTys;
     SmallVector<std::string, 20> shaderInputNames;
-    uint64_t inRegMask =
-        generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
+    uint64_t inRegMask = 0;
+    if (!origFunc->hasFnAttribute(Attribute::NoInline))
+      inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
 
     // Create the new function and transfer code and attributes to it.
     Function *newFunc =
         addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMask, true);
     const bool isEntryPoint = isShaderEntryPoint(newFunc);
-    newFunc->setCallingConv(isEntryPoint ? CallingConv::AMDGPU_CS : CallingConv::AMDGPU_Gfx);
+    newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
+                                                                                : CallingConv::AMDGPU_Gfx);
 
-    // Set Attributes on new function.
-    setFuncAttrs(newFunc);
+    // Set Attributes on new function, if it's not an non-inlined function.
+    if (!newFunc->hasFnAttribute(Attribute::NoInline))
+      setFuncAttrs(newFunc);
 
     // Change any uses of the old function to a bitcast of the new function.
     SmallVector<Use *, 4> funcUses;
@@ -766,8 +781,11 @@ void PatchEntryPointMutate::processComputeFuncs(ShaderInputs *shaderInputs, Modu
     int argOffset = origType->getNumParams();
     origFunc->eraseFromParent();
 
-    if (isComputeWithCalls())
-      processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    //if (isComputeWithCalls())
+    processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+
+    LLPC_OUTS("Function after processFuncs");
+    newFunc->dump();
   }
 }
 
@@ -782,6 +800,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
   // - a compute pipeline with non-inlined functions;
   // - a compute pipeline with calls to library functions;
   // - a compute library.
+  // - a forced non-inlined call.
   // We need to scan the code and modify each call to append the extra args.
   IRBuilder<> builder(func.getContext());
   for (BasicBlock &block : func) {
@@ -793,6 +812,10 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       // Got a call. Skip it if it calls an intrinsic or an internal lgc.* function.
       Value *calledVal = call->getCalledOperand();
       Function *calledFunc = dyn_cast<Function>(calledVal);
+
+      bool isNonInlinedFunc = calledFunc->hasFnAttribute(Attribute::NoInline);
+      LLPC_OUTS("Processing call to function:");
+      calledFunc->dump();
       if (calledFunc) {
         if (calledFunc->isIntrinsic() || calledFunc->getName().startswith(lgcName::InternalCallPrefix))
           continue;
@@ -807,10 +830,14 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         argTys.push_back(call->getArgOperand(idx)->getType());
         args.push_back(call->getArgOperand(idx));
       }
-      for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-        argTys.push_back(func.getArg(idx + argOffset)->getType());
-        args.push_back(func.getArg(idx + argOffset));
+      
+      if (!isNonInlinedFunc) {
+        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+          argTys.push_back(func.getArg(idx + argOffset)->getType());
+          args.push_back(func.getArg(idx + argOffset));
+        }
       }
+
       // Get the new called value as a bitcast of the old called value. If the old called value is already
       // the inverse bitcast, just drop that bitcast.
       // If the old called value was a function declaration, we did not insert a bitcast
@@ -828,9 +855,12 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
       // Mark sgpr arguments as inreg
-      for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-        if ((inRegMask >> idx) & 1)
-          newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+      // Don't pass arguments to non-inlined funcs.
+      if (!isNonInlinedFunc) {
+        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+          if ((inRegMask >> idx) & 1)
+            newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+        }
       }
 
       // Replace and erase the old one.

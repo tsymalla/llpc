@@ -33,6 +33,8 @@
 #include "llpcCompiler.h"
 #include "llpcContext.h"
 #include "lgc/Builder.h"
+#include "lgc/CommonDefs.h"
+#include "llpcDebug.h"
 #include <sstream>
 #include <string>
 
@@ -187,6 +189,8 @@ void SpirvLowerTranslator::translateSpirvToLlvm(const PipelineShaderInfo *shader
 #endif
 
     func.addFnAttr(Attribute::NoInline);
+    LLPC_OUTS("Dumping meta data for:");
+    func.dump();
   }
 }
 
