@@ -316,6 +316,8 @@ cl::opt<ResourceLayoutScheme> LayoutScheme("resource-layout-scheme", cl::desc("T
 cl::opt<bool> AssertToMsgBox("assert-to-msgbox", cl::desc("Pop message box when assert is hit"));
 #endif
 
+cl::opt<bool> PreventInlining("prevent-inlining", cl::desc("If enabled, all function calls will be set to NoInline"), cl::init(true));
+
 } // namespace
 // clang-format on
 namespace llvm {
@@ -467,6 +469,8 @@ static Result initCompileInfo(CompileInfo *compileInfo) {
   if (LlpcOptLevel.getPosition() != 0) {
     compileInfo->optimizationLevel = LlpcOptLevel;
   }
+
+  compileInfo->preventInlining = PreventInlining;
 
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
   // We want the default optimization level to be "Default" which is not 0.

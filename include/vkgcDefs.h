@@ -487,6 +487,7 @@ struct PipelineOptions {
   ResourceLayoutScheme resourceLayoutScheme;     ///< Resource layout scheme
   ThreadGroupSwizzleMode threadGroupSwizzleMode; ///< Controls thread group swizzle mode for compute shader.
   bool reverseThreadGroup;                       ///< If set, enable thread group reversing
+  bool preventInlining; ///< If set, prevent function call inlining
 };
 
 /// Prototype of allocator for output data buffer, used in shader-specific operations.

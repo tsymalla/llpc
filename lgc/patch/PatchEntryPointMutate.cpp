@@ -672,6 +672,8 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   Function *origEntryPoint = m_entryPoint;
 
   // Create the new function and transfer code and attributes to it.
+  LLPC_OUTS("Original entry point:\n");
+  origEntryPoint->dump();
   Function *entryPoint =
       addFunctionArgs(origEntryPoint, origEntryPoint->getFunctionType()->getReturnType(), argTys, argNames, inRegMask);
 

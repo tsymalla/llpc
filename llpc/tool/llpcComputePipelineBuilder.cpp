@@ -133,6 +133,7 @@ Expected<BinaryData> ComputePipelineBuilder::buildComputePipeline() {
   pipelineInfo->options.enableRelocatableShaderElf = compileInfo.relocatableShaderElf;
   pipelineInfo->options.scalarBlockLayout = compileInfo.scalarBlockLayout;
   pipelineInfo->options.enableScratchAccessBoundsChecks = compileInfo.scratchAccessBoundsChecks;
+  pipelineInfo->options.preventInlining = compileInfo.preventInlining;
   pipelineInfo->options.forceCsThreadIdSwizzling = compileInfo.compPipelineInfo.options.forceCsThreadIdSwizzling;
   pipelineInfo->options.overrideThreadGroupSizeX = compileInfo.compPipelineInfo.options.overrideThreadGroupSizeX;
   pipelineInfo->options.overrideThreadGroupSizeY = compileInfo.compPipelineInfo.options.overrideThreadGroupSizeY;

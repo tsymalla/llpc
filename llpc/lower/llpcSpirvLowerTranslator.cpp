@@ -188,9 +188,14 @@ void SpirvLowerTranslator::translateSpirvToLlvm(const PipelineShaderInfo *shader
       func.removeFnAttr(Attribute::NoInline);
 #endif
 
-    func.addFnAttr(Attribute::NoInline);
-    LLPC_OUTS("Dumping meta data for:");
-    func.dump();
+    if (m_context->getPipelineContext()->getPipelineOptions()->preventInlining) {
+      LLPC_OUTS("Inlining disabled!");
+      func.addFnAttr(Attribute::NoInline);
+    }
+    else {
+      LLPC_OUTS("Inlining enabled!");
+      func.addFnAttr(Attribute::AlwaysInline);
+    }
   }
 }
 
