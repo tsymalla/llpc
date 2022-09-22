@@ -92,11 +92,9 @@ PipelineShadersResult PipelineShaders::runImpl(Module &module) {
 
   for (auto &func : module) {
     if (isShaderEntryPoint(&func)) {
-      func.dump();
       auto shaderStage = lgc::getShaderStage(&func);
 
       if (shaderStage != ShaderStageInvalid) {
-        LLPC_OUTS("Regard as entry point.");
         result.m_entryPoints[shaderStage] = &func;
         result.m_entryPointMap[&func] = shaderStage;
       }

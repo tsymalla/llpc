@@ -62,6 +62,7 @@
 #include "lgc/state/PalMetadata.h"
 #include "lgc/state/PipelineShaders.h"
 #include "lgc/state/PipelineState.h"
+#include "lgc/state/ShaderStage.h"
 #include "lgc/state/TargetInfo.h"
 #include "lgc/util/AddressExtender.h"
 #include "lgc/util/BuilderBase.h"
@@ -175,24 +176,30 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   if (m_pipelineState->isGraphics()) {
     // Process each shader in turn, but not the copy shader.
     for (unsigned shaderStage = 0; shaderStage < ShaderStageNativeStageCount; ++shaderStage) {
-      m_entryPoint = pipelineShaders.getEntryPoint(static_cast<ShaderStage>(shaderStage));
+      m_shaderStage = static_cast<ShaderStage>(shaderStage);
+      m_entryPoint = pipelineShaders.getEntryPoint(m_shaderStage);
       if (m_entryPoint) {
-        m_shaderStage = static_cast<ShaderStage>(shaderStage);
         processShader(&shaderInputs);
-        processFuncs(&shaderInputs, module, m_shaderStage);
       }
     }
   } else {
-    processFuncs(&shaderInputs, module);
+    processFuncs(&shaderInputs, module, ShaderStageCompute);
+  }
+
+  for (unsigned shaderStage = 0; shaderStage < ShaderStageNativeStageCount; ++shaderStage) {
+    m_shaderStage = static_cast<ShaderStage>(shaderStage);
+    m_entryPoint = pipelineShaders.getEntryPoint(m_shaderStage);
+    if (m_entryPoint) {
+      processFuncs(&shaderInputs, module, m_shaderStage);
+    }
   }
   
+  // Fix up shader input uses to use entry args.
+  shaderInputs.fixupUses(*m_module, m_pipelineState);
 
   // Fix up user data uses to use entry args.
   fixupUserDataUses(*m_module);
   m_userDataUsage.clear();
-
-  // Fix up shader input uses to use entry args.
-  shaderInputs.fixupUses(*m_module, m_pipelineState);
 
   return true;
 }
@@ -672,8 +679,6 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   Function *origEntryPoint = m_entryPoint;
 
   // Create the new function and transfer code and attributes to it.
-  LLPC_OUTS("Original entry point:\n");
-  origEntryPoint->dump();
   Function *entryPoint =
       addFunctionArgs(origEntryPoint, origEntryPoint->getFunctionType()->getReturnType(), argTys, argNames, inRegMask);
 
@@ -730,7 +735,6 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
 void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage) {
   m_shaderStage = shaderStage;
 
-
   // We no longer support compute shader fixed layout required before PAL interface version 624.
   if (m_pipelineState->getLgcContext()->getPalAbiVersion() < 624)
     report_fatal_error("Compute shader not supported before PAL version 624");
@@ -743,22 +747,17 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
         // This is the declaration of a callable function that is defined in a different module.
         func.setCallingConv(CallingConv::AMDGPU_Gfx);
       }
-    } else {
+    } else if (!isShaderEntryPoint(&func)) {
       origFuncs.push_back(&func);
     }
   }
 
   for (Function *origFunc : origFuncs) {
-    LLPC_OUTS("Function before processFuncs");
-    origFunc->dump();
-
     auto *origType = origFunc->getFunctionType();
     // Determine what args need to be added on to all functions.
     SmallVector<Type *, 20> shaderInputTys;
     SmallVector<std::string, 20> shaderInputNames;
-    uint64_t inRegMask = 0;
-    if (!origFunc->hasFnAttribute(Attribute::NoInline))
-      inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
+    uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
 
     // Create the new function and transfer code and attributes to it.
     Function *newFunc =
@@ -768,7 +767,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
                                                                                 : CallingConv::AMDGPU_Gfx);
 
     // Set Attributes on new function, if it's not an non-inlined function.
-    if (!newFunc->hasFnAttribute(Attribute::NoInline))
+    //if (!newFunc->hasFnAttribute(Attribute::NoInline))
       setFuncAttrs(newFunc);
 
     // Change any uses of the old function to a bitcast of the new function.
@@ -785,9 +784,6 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
 
     //if (isComputeWithCalls())
     processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
-
-    LLPC_OUTS("Function after processFuncs");
-    newFunc->dump();
   }
 }
 
@@ -815,9 +811,6 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       Value *calledVal = call->getCalledOperand();
       Function *calledFunc = dyn_cast<Function>(calledVal);
 
-      bool isNonInlinedFunc = calledFunc->hasFnAttribute(Attribute::NoInline);
-      LLPC_OUTS("Processing call to function:");
-      calledFunc->dump();
       if (calledFunc) {
         if (calledFunc->isIntrinsic() || calledFunc->getName().startswith(lgcName::InternalCallPrefix))
           continue;
@@ -833,11 +826,9 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
       
-      if (!isNonInlinedFunc) {
-        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-          argTys.push_back(func.getArg(idx + argOffset)->getType());
-          args.push_back(func.getArg(idx + argOffset));
-        }
+      for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+        argTys.push_back(func.getArg(idx + argOffset)->getType());
+        args.push_back(func.getArg(idx + argOffset));
       }
 
       // Get the new called value as a bitcast of the old called value. If the old called value is already
@@ -857,12 +848,9 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
       // Mark sgpr arguments as inreg
-      // Don't pass arguments to non-inlined funcs.
-      if (!isNonInlinedFunc) {
-        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-          if ((inRegMask >> idx) & 1)
-            newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
-        }
+      for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+        if ((inRegMask >> idx) & 1)
+          newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
       }
 
       // Replace and erase the old one.

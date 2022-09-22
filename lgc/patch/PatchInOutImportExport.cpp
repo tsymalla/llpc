@@ -1143,7 +1143,7 @@ void PatchInOutImportExport::visitCallInst(CallInst &callInst) {
 // @param retInst : "Ret" instruction
 void PatchInOutImportExport::visitReturnInst(ReturnInst &retInst) {
   // We only handle the "ret" of shader entry point
-  if (m_shaderStage == ShaderStageInvalid)
+  if (m_shaderStage == ShaderStageInvalid || retInst.getParent()->getParent()->hasFnAttribute(Attribute::NoInline))
     return;
 
   const auto nextStage = m_pipelineState->getNextShaderStage(m_shaderStage);
