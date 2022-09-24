@@ -145,7 +145,7 @@ Expected<BinaryData> GraphicsPipelineBuilder::buildGraphicsPipeline() {
   pipelineInfo->options.enableRelocatableShaderElf = compileInfo.relocatableShaderElf;
   pipelineInfo->options.scalarBlockLayout = compileInfo.scalarBlockLayout;
   pipelineInfo->options.enableScratchAccessBoundsChecks = compileInfo.scratchAccessBoundsChecks;
-  pipelineInfo->options.preventInlining = compileInfo.preventInlining;
+  pipelineInfo->options.enableInlining = compileInfo.enableInlining;
 #if LLPC_CLIENT_INTERFACE_MAJOR_VERSION >= 53
   if (compileInfo.optimizationLevel.has_value()) {
     pipelineInfo->options.optimizationLevel = compileInfo.optimizationLevel.value();

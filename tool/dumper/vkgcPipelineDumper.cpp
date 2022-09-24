@@ -1484,7 +1484,7 @@ void PipelineDumper::updateHashForPipelineOptions(const PipelineOptions *options
   hasher->Update(options->enableRelocatableShaderElf);
   hasher->Update(options->disableImageResourceCheck);
   hasher->Update(options->enableScratchAccessBoundsChecks);
-  hasher->Update(options->preventInlining);
+  hasher->Update(options->enableInlining);
   hasher->Update(options->resourceLayoutScheme);
 
   if (!isRelocatableShader) {
