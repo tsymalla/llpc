@@ -747,7 +747,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
         // This is the declaration of a callable function that is defined in a different module.
         func.setCallingConv(CallingConv::AMDGPU_Gfx);
       }
-    } else if (!isShaderEntryPoint(&func)) {
+    } else {
       origFuncs.push_back(&func);
     }
   }
@@ -759,31 +759,35 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
     SmallVector<std::string, 20> shaderInputNames;
     uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
 
+    const bool isEntryPoint = isShaderEntryPoint(origFunc);
     // Create the new function and transfer code and attributes to it.
-    Function *newFunc =
-        addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMask, true);
-    const bool isEntryPoint = isShaderEntryPoint(newFunc);
-    newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
-                                                                                : CallingConv::AMDGPU_Gfx);
+    Function *currFunc = origFunc;
+    if (!isEntryPoint) {
+      Function *newFunc =
+          addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMask, true);
+      currFunc = newFunc;
+      newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
+                                                                                  : CallingConv::AMDGPU_Gfx);
 
-    // Set Attributes on new function, if it's not an non-inlined function.
-    //if (!newFunc->hasFnAttribute(Attribute::NoInline))
       setFuncAttrs(newFunc);
 
-    // Change any uses of the old function to a bitcast of the new function.
-    SmallVector<Use *, 4> funcUses;
-    for (auto &use : origFunc->uses())
-      funcUses.push_back(&use);
-    Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, origFunc->getType());
-    for (Use *use : funcUses)
-      *use = bitCastFunc;
+      // Change any uses of the old function to a bitcast of the new function.
+      SmallVector<Use *, 4> funcUses;
+      for (auto &use : origFunc->uses())
+        funcUses.push_back(&use);
+      Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, origFunc->getType());
+      for (Use *use : funcUses)
+        *use = bitCastFunc;
+    }
 
     // Remove original function.
     int argOffset = origType->getNumParams();
-    origFunc->eraseFromParent();
+    if (!isEntryPoint) {
+      origFunc->eraseFromParent();
+    }
 
     //if (isComputeWithCalls())
-    processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    processCalls(*currFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
   }
 }
 
@@ -826,9 +830,11 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
       
-      for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-        argTys.push_back(func.getArg(idx + argOffset)->getType());
-        args.push_back(func.getArg(idx + argOffset));
+      if (!isShaderEntryPoint(&func)) {
+        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+          argTys.push_back(func.getArg(idx + argOffset)->getType());
+          args.push_back(func.getArg(idx + argOffset));
+        }
       }
 
       // Get the new called value as a bitcast of the old called value. If the old called value is already
@@ -848,9 +854,11 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
       // Mark sgpr arguments as inreg
-      for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-        if ((inRegMask >> idx) & 1)
-          newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+      if (!isShaderEntryPoint(&func)) {
+        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+          if ((inRegMask >> idx) & 1)
+            newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+        }
       }
 
       // Replace and erase the old one.
