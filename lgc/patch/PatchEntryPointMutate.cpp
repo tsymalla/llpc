@@ -261,6 +261,8 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
   for (Function &func : *module) {
     if (!func.isDeclaration())
       continue;
+
+      func.dump();
     if (func.getName().startswith(lgcName::SpillTable)) {
       for (User *user : func.users()) {
         CallInst *call = cast<CallInst>(user);
@@ -423,7 +425,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
 
   // For each function definition...
   for (Function &func : module) {
-    if (func.isDeclaration())
+    if (func.isDeclaration() || func.hasFnAttribute(Attribute::NoInline))
       continue;
 
     ShaderStage stage = getShaderStage(&func);
@@ -757,21 +759,22 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
     // Determine what args need to be added on to all functions.
     SmallVector<Type *, 20> shaderInputTys;
     SmallVector<std::string, 20> shaderInputNames;
-    uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
-
+    uint64_t inRegMask = 0;
     const bool isEntryPoint = isShaderEntryPoint(origFunc);
+    if (isEntryPoint) {
+      inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
+    }
     // Create the new function and transfer code and attributes to it.
-    Function *currFunc = origFunc;
+    Function *newFunc =
+        addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMask, true);
+
+    newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
+                                                                                : CallingConv::AMDGPU_Gfx);
+
+    setFuncAttrs(newFunc);
+
+    // Change any uses of the old function to a bitcast of the new function.
     if (!isEntryPoint) {
-      Function *newFunc =
-          addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMask, true);
-      currFunc = newFunc;
-      newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
-                                                                                  : CallingConv::AMDGPU_Gfx);
-
-      setFuncAttrs(newFunc);
-
-      // Change any uses of the old function to a bitcast of the new function.
       SmallVector<Use *, 4> funcUses;
       for (auto &use : origFunc->uses())
         funcUses.push_back(&use);
@@ -787,7 +790,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
     }
 
     //if (isComputeWithCalls())
-    processCalls(*currFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
   }
 }
 

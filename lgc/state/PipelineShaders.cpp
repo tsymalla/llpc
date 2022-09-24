@@ -91,7 +91,7 @@ PipelineShadersResult PipelineShaders::runImpl(Module &module) {
   PipelineShadersResult result;
 
   for (auto &func : module) {
-    if (isShaderEntryPoint(&func)) {
+    if (isShaderEntryPoint(&func) && !func.hasFnAttribute(Attribute::NoInline)) {
       auto shaderStage = lgc::getShaderStage(&func);
 
       if (shaderStage != ShaderStageInvalid) {

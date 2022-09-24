@@ -318,7 +318,7 @@ void ShaderInputs::gatherUsage(Module &module) {
 void ShaderInputs::fixupUses(Module &module, PipelineState *pipelineState) {
   // For each function definition...
   for (Function &func : module) {
-    if (func.isDeclaration())
+    if (func.isDeclaration() || func.hasFnAttribute(Attribute::NoInline))
       continue;
 
     ShaderStage stage = getShaderStage(&func);

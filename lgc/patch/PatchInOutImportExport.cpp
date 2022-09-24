@@ -520,6 +520,11 @@ void PatchInOutImportExport::processShader() {
 // @param calleeFuncs : a list of candidate callee functions to check
 void PatchInOutImportExport::visitCallInsts(ArrayRef<Function *> calleeFuncs) {
   for (auto callee : calleeFuncs) {
+    callee->dump();
+    if (callee->hasFnAttribute(Attribute::NoInline)) {
+      continue;
+    }
+
     for (auto user : callee->users()) {
       if (CallInst *callInst = dyn_cast<CallInst>(user)) {
         if (callInst->getFunction() == m_entryPoint)
@@ -1807,6 +1812,7 @@ Value *PatchInOutImportExport::patchFsGenericInputImport(Type *inputTy, unsigned
   }
 
   auto &entryArgIdxs = m_pipelineState->getShaderInterfaceData(ShaderStageFragment)->entryArgIdxs.fs;
+  m_entryPoint->dump();
   auto primMask = getFunctionArgument(m_entryPoint, entryArgIdxs.primMask);
   Value *coordI = nullptr;
   Value *coordJ = nullptr;
