@@ -114,7 +114,7 @@ private:
   void fixupUserDataUses(llvm::Module &module);
 
   void processShader(ShaderInputs *shaderInputs);
-  void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage);
+  void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage, llvm::Function *entryPoint = nullptr);
   void processCalls(llvm::Function &func, llvm::SmallVectorImpl<llvm::Type *> &shaderInputTys,
                     llvm::SmallVectorImpl<std::string> &shaderInputNames, uint64_t inRegMask, unsigned argOffset);
   void setFuncAttrs(llvm::Function *entryPoint);

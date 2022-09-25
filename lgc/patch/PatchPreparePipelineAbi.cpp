@@ -237,6 +237,7 @@ void PatchPreparePipelineAbi::mergeShader(Module &module) {
       if (enableNgg) {
         // If NGG is enabled, ES-GS merged shader should be present even if GS is absent
         auto esEntryPoint = m_pipelineShaders->getEntryPoint(ShaderStageVertex);
+        esEntryPoint->dump();
         if (esEntryPoint) {
           if (esEntryPoint)
             lgc::setShaderStage(esEntryPoint, ShaderStageVertex);

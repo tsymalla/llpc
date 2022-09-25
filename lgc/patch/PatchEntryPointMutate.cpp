@@ -185,14 +185,6 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   } else {
     processFuncs(&shaderInputs, module, ShaderStageCompute);
   }
-
-  for (unsigned shaderStage = 0; shaderStage < ShaderStageNativeStageCount; ++shaderStage) {
-    m_shaderStage = static_cast<ShaderStage>(shaderStage);
-    m_entryPoint = pipelineShaders.getEntryPoint(m_shaderStage);
-    if (m_entryPoint) {
-      processFuncs(&shaderInputs, module, m_shaderStage);
-    }
-  }
   
   // Fix up shader input uses to use entry args.
   shaderInputs.fixupUses(*m_module, m_pipelineState);
@@ -262,7 +254,6 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
     if (!func.isDeclaration())
       continue;
 
-      func.dump();
     if (func.getName().startswith(lgcName::SpillTable)) {
       for (User *user : func.users()) {
         CallInst *call = cast<CallInst>(user);
@@ -724,6 +715,8 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
     // Don't mess up function args for non-compute non-inlined functions.
     setFuncAttrs(entryPoint);
   }
+  
+  processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
 
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
@@ -734,7 +727,8 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
 //
 // @param shaderInputs : ShaderInputs object representing hardware-provided shader inputs
 // @param [in/out] module : Module
-void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage) {
+// Exclude an entry point.
+void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage, Function *entryPoint) {
   m_shaderStage = shaderStage;
 
   // We no longer support compute shader fixed layout required before PAL interface version 624.
@@ -755,42 +749,50 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
   }
 
   for (Function *origFunc : origFuncs) {
+    bool skipFunc = false;
+    if (entryPoint && origFunc == entryPoint)
+      skipFunc = true;
+
     auto *origType = origFunc->getFunctionType();
+
     // Determine what args need to be added on to all functions.
     SmallVector<Type *, 20> shaderInputTys;
     SmallVector<std::string, 20> shaderInputNames;
     uint64_t inRegMask = 0;
-    const bool isEntryPoint = isShaderEntryPoint(origFunc);
-    if (isEntryPoint) {
-      inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
-    }
-    // Create the new function and transfer code and attributes to it.
-    Function *newFunc =
-        addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMask, true);
-
-    newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
-                                                                                : CallingConv::AMDGPU_Gfx);
-
-    setFuncAttrs(newFunc);
-
-    // Change any uses of the old function to a bitcast of the new function.
-    if (!isEntryPoint) {
-      SmallVector<Use *, 4> funcUses;
-      for (auto &use : origFunc->uses())
-        funcUses.push_back(&use);
-      Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, origFunc->getType());
-      for (Use *use : funcUses)
-        *use = bitCastFunc;
-    }
-
-    // Remove original function.
     int argOffset = origType->getNumParams();
-    if (!isEntryPoint) {
-      origFunc->eraseFromParent();
-    }
+    if (!skipFunc) {
+      const bool isEntryPoint = isShaderEntryPoint(origFunc);
+      if (isEntryPoint) {
+        inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
+      }
+      // Create the new function and transfer code and attributes to it.
+      Function *newFunc =
+          addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
 
-    //if (isComputeWithCalls())
-    processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+      newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
+                                                                                  : CallingConv::AMDGPU_Gfx);
+
+      setFuncAttrs(newFunc);
+
+      // Change any uses of the old function to a bitcast of the new function.
+      if (!isEntryPoint) {
+        SmallVector<Use *, 4> funcUses;
+        for (auto &use : origFunc->uses())
+          funcUses.push_back(&use);
+        Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, origFunc->getType());
+        for (Use *use : funcUses)
+          *use = bitCastFunc;
+      }
+
+      // Remove original function.
+      argOffset = origType->getNumParams();
+      if (!isEntryPoint) {
+        origFunc->eraseFromParent();
+      }
+      processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    } else {
+      processCalls(*origFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    }
   }
 }
 
@@ -814,6 +816,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       auto call = dyn_cast<CallInst>(&inst);
       if (!call)
         continue;
+
       // Got a call. Skip it if it calls an intrinsic or an internal lgc.* function.
       Value *calledVal = call->getCalledOperand();
       Function *calledFunc = dyn_cast<Function>(calledVal);
