@@ -179,6 +179,8 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
       m_shaderStage = static_cast<ShaderStage>(shaderStage);
       m_entryPoint = pipelineShaders.getEntryPoint(m_shaderStage);
       if (m_entryPoint) {
+        LLPC_OUTS(m_shaderStage);
+        m_entryPoint->dump();
         processShader(&shaderInputs);
       }
     }
@@ -206,10 +208,10 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
 //
 // @param module : IR module
 void PatchEntryPointMutate::setupComputeWithCalls(Module *module) {
-  m_computeWithCalls = false;
+  m_usesCalls = false;
 
   if (m_pipelineState->isComputeLibrary()) {
-    m_computeWithCalls = true;
+    m_usesCalls = true;
     return;
   }
 
@@ -218,7 +220,7 @@ void PatchEntryPointMutate::setupComputeWithCalls(Module *module) {
   for (Function &func : *module) {
     if (func.isDeclaration() && func.getIntrinsicID() == Intrinsic::not_intrinsic &&
         !func.getName().startswith(lgcName::InternalCallPrefix) && !func.user_empty()) {
-      m_computeWithCalls = true;
+      m_usesCalls = true;
       return;
     }
 
@@ -229,7 +231,7 @@ void PatchEntryPointMutate::setupComputeWithCalls(Module *module) {
           Value *calledVal = call->getCalledOperand();
           if (isa<Function>(calledVal) || call->isInlineAsm())
             continue;
-          m_computeWithCalls = true;
+          m_usesCalls = true;
           return;
         }
       }
@@ -474,7 +476,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     }
 
     // Handle the push constant pointer, always do that for compute libraries.
-    if (!userDataUsage->pushConst.users.empty() || isComputeWithCalls()) {
+    if (!userDataUsage->pushConst.users.empty() || usesCalls()) {
       // If all uses of the push constant pointer are unspilled, we can just replace the lgc.push.const call
       // with undef, as the address is ultimately not used anywhere.
       Value *replacementVal = nullptr;
@@ -670,6 +672,7 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, argTys, argNames, 0);
 
   Function *origEntryPoint = m_entryPoint;
+  m_entryPoint->dump();
 
   // Create the new function and transfer code and attributes to it.
   Function *entryPoint =
@@ -715,11 +718,54 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
     // Don't mess up function args for non-compute non-inlined functions.
     setFuncAttrs(entryPoint);
   }
-  
-  processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
 
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
+  
+  processFunc(shaderInputs, entryPoint, m_shaderStage);
+  processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
+}
+
+void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage) {
+  m_shaderStage = shaderStage;
+  auto *origType = function->getFunctionType();
+
+  // Determine what args need to be added on to all functions.
+  SmallVector<Type *, 20> shaderInputTys;
+  SmallVector<std::string, 20> shaderInputNames;
+  uint64_t inRegMask = 0;
+  int argOffset = origType->getNumParams();
+  const bool isEntryPointForStage = isShaderEntryPoint(function);
+  if (shaderStage == ShaderStageCompute || !isEntryPointForStage) {
+    inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
+
+    // Create the new function and transfer code and attributes to it.
+    Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
+
+    newFunc->setCallingConv(isEntryPointForStage && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
+                                                                                        : CallingConv::AMDGPU_Gfx);
+
+    setFuncAttrs(newFunc);
+
+    // Change any uses of the old function to a bitcast of the new function.
+    SmallVector<Use *, 4> funcUses;
+    for (auto &use : function->uses())
+      funcUses.push_back(&use);
+    Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, function->getType());
+    for (Use *use : funcUses)
+      *use = bitCastFunc;
+
+    // Remove original function.
+    argOffset = origType->getNumParams();
+      function->eraseFromParent();
+
+    processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+
+    newFunc->dump();
+  } else {
+    processCalls(*function, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    function->dump();
+  }
 }
 
 // =====================================================================================================================
@@ -743,56 +789,18 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
         // This is the declaration of a callable function that is defined in a different module.
         func.setCallingConv(CallingConv::AMDGPU_Gfx);
       }
+    } else if (func.hasFnAttribute(Attribute::NoInline)) {
+      func.setCallingConv(CallingConv::AMDGPU_Gfx);
     } else {
       origFuncs.push_back(&func);
     }
   }
 
   for (Function *origFunc : origFuncs) {
-    bool skipFunc = false;
     if (entryPoint && origFunc == entryPoint)
-      skipFunc = true;
+      continue;
 
-    auto *origType = origFunc->getFunctionType();
-
-    // Determine what args need to be added on to all functions.
-    SmallVector<Type *, 20> shaderInputTys;
-    SmallVector<std::string, 20> shaderInputNames;
-    uint64_t inRegMask = 0;
-    int argOffset = origType->getNumParams();
-    if (!skipFunc) {
-      const bool isEntryPoint = isShaderEntryPoint(origFunc);
-      if (isEntryPoint) {
-        inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
-      }
-      // Create the new function and transfer code and attributes to it.
-      Function *newFunc =
-          addFunctionArgs(origFunc, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
-
-      newFunc->setCallingConv(isEntryPoint && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
-                                                                                  : CallingConv::AMDGPU_Gfx);
-
-      setFuncAttrs(newFunc);
-
-      // Change any uses of the old function to a bitcast of the new function.
-      if (!isEntryPoint) {
-        SmallVector<Use *, 4> funcUses;
-        for (auto &use : origFunc->uses())
-          funcUses.push_back(&use);
-        Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, origFunc->getType());
-        for (Use *use : funcUses)
-          *use = bitCastFunc;
-      }
-
-      // Remove original function.
-      argOffset = origType->getNumParams();
-      if (!isEntryPoint) {
-        origFunc->eraseFromParent();
-      }
-      processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
-    } else {
-      processCalls(*origFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
-    }
+    processFunc(shaderInputs, origFunc, shaderStage);
   }
 }
 
@@ -826,7 +834,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           continue;
       } else if (call->isInlineAsm()) {
         continue;
-      }
+      } 
       // Build a new arg list, made of the ABI args shared by all functions (user data and hardware shader
       // inputs), plus the original args on the call.
       SmallVector<Type *, 20> argTys;
@@ -836,7 +844,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
       
-      if (!isShaderEntryPoint(&func)) {
+      if (m_shaderStage == ShaderStageCompute || (!isShaderEntryPoint(&func) && !func.hasFnAttribute(Attribute::NoInline))) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           argTys.push_back(func.getArg(idx + argOffset)->getType());
           args.push_back(func.getArg(idx + argOffset));
@@ -860,7 +868,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
       // Mark sgpr arguments as inreg
-      if (!isShaderEntryPoint(&func)) {
+      if (m_shaderStage == ShaderStageCompute || !isShaderEntryPoint(&func)) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           if ((inRegMask >> idx) & 1)
             newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
@@ -1217,7 +1225,7 @@ void PatchEntryPointMutate::addSpecialUserDataArgs(SmallVectorImpl<UserDataArg> 
     // Unlike all the special user data values above, which go after the user data node args, this goes before.
     // That is to ensure that, with a compute pipeline using a library, library code knows where to find it
     // even if it thinks that the user data layout is a prefix of what the pipeline thinks it is.
-    if (isComputeWithCalls() || userDataUsage->isSpecialUserDataUsed(UserDataMapping::Workgroup)) {
+    if (usesCalls() || userDataUsage->isSpecialUserDataUsed(UserDataMapping::Workgroup)) {
       auto numWorkgroupsPtrTy = PointerType::get(FixedVectorType::get(builder.getInt32Ty(), 3), ADDR_SPACE_CONST);
       userDataArgs.push_back(UserDataArg(numWorkgroupsPtrTy, "numWorkgroupsPtr", UserDataMapping::Workgroup, nullptr));
     }
@@ -1359,7 +1367,7 @@ void PatchEntryPointMutate::addUserDataArgs(SmallVectorImpl<UserDataArg> &userDa
       UserDataNodeUsage *descSetUsage = nullptr;
       if (userDataUsage->descriptorTables.size() > userDataNodeIdx)
         descSetUsage = &userDataUsage->descriptorTables[userDataNodeIdx];
-      if (!isComputeWithCalls() && (!descSetUsage || descSetUsage->users.empty()))
+      if (!usesCalls() && (!descSetUsage || descSetUsage->users.empty()))
         break;
 
       unsigned userDataValue = node.offsetInDwords;
@@ -1382,7 +1390,7 @@ void PatchEntryPointMutate::addUserDataArgs(SmallVectorImpl<UserDataArg> &userDa
 
     case ResourceNodeType::PushConst: {
       // Always spill for compute libraries.
-      if (!isComputeWithCalls()) {
+      if (!usesCalls()) {
         // We add a potential unspilled arg for each separate dword offset of the push const at which there is a load.
         // We already know that loads we have on our pushConstOffsets lists are at dword-aligned offset and
         // dword-aligned size. We need to ensure that all loads are the same size, by removing ones that are bigger than
@@ -1438,7 +1446,7 @@ void PatchEntryPointMutate::addUserDataArgs(SmallVectorImpl<UserDataArg> &userDa
     }
 
     default:
-      if (isComputeWithCalls()) {
+      if (usesCalls()) {
         // Always spill for compute libraries.
         break;
       }
@@ -1537,7 +1545,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
   // table pointer, even if it is not needed, because library code does not know whether a spill table pointer is
   // needed in the pipeline. Thus we cannot use s15 for anything else. Using the single-arg UserDataArg
   // constructor like this means that the arg is not used, so it will not be set up in PAL metadata.
-  if (m_computeWithCalls && !spillTableArg.has_value())
+  if (usesCalls() && !spillTableArg.has_value())
     spillTableArg = UserDataArg(builder.getInt32Ty(), "spillTable", UserDataMapping::SpillTable,
                                 &userDataUsage->spillTable.entryArgIdx);
 
@@ -1549,7 +1557,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
                              : m_pipelineState->getTargetInfo().getGpuProperty().maxUserDataCount;
 
   // FIXME Restricting user data as the backend does not support more sgprs as arguments
-  if (isComputeWithCalls() && userDataEnd > 16)
+  if (usesCalls() && userDataEnd > 16)
     userDataEnd = 16;
 
   for (auto &userDataArg : specialUserDataArgs)
@@ -1601,7 +1609,7 @@ void PatchEntryPointMutate::determineUnspilledUserDataArgs(ArrayRef<UserDataArg>
 
   // For compute-with-calls, add extra padding unspilled args until we get to s15. s15 will then be used for
   // the spill table pointer below, even if we didn't appear to need one.
-  if (isComputeWithCalls()) {
+  if (usesCalls()) {
     while (userDataIdx < userDataEnd) {
       unspilledArgs.push_back(UserDataArg(builder.getInt32Ty(), Twine()));
       ++userDataIdx;
@@ -1654,8 +1662,8 @@ ShaderStage PatchEntryPointMutate::getMergedShaderStage(ShaderStage stage) const
 }
 
 // =====================================================================================================================
-bool PatchEntryPointMutate::isComputeWithCalls() const {
-  return m_computeWithCalls;
+bool PatchEntryPointMutate::usesCalls() const {
+  return m_usesCalls;
 }
 
 // =====================================================================================================================

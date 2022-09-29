@@ -114,6 +114,7 @@ private:
   void fixupUserDataUses(llvm::Module &module);
 
   void processShader(ShaderInputs *shaderInputs);
+  void processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage);
   void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage, llvm::Function *entryPoint = nullptr);
   void processCalls(llvm::Function &func, llvm::SmallVectorImpl<llvm::Type *> &shaderInputTys,
                     llvm::SmallVectorImpl<std::string> &shaderInputNames, uint64_t inRegMask, unsigned argOffset);
@@ -143,12 +144,12 @@ private:
   // Get the shader stage that the given shader stage is merged into.
   ShaderStage getMergedShaderStage(ShaderStage stage) const;
 
-  bool isComputeWithCalls() const;
+  bool usesCalls() const;
 
   bool m_hasTs;                             // Whether the pipeline has tessllation shader
   bool m_hasGs;                             // Whether the pipeline has geometry shader
   PipelineState *m_pipelineState = nullptr; // Pipeline state from PipelineStateWrapper pass
-  bool m_computeWithCalls = false;          // Whether this is compute pipeline with calls or compute library
+  bool m_usesCalls = false;                 // Whether this uses function calls
   // Per-HW-shader-stage gathered user data usage information.
   llvm::SmallVector<std::unique_ptr<UserDataUsage>, ShaderStageCount> m_userDataUsage;
 };
