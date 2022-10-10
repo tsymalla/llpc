@@ -1726,7 +1726,8 @@ Result Compiler::BuildGraphicsPipeline(const GraphicsPipelineBuildInfo *pipeline
 #if VKI_RAY_TRACING
   // Setup the rayquery Graphics PipelineShaderinfo
   PipelineShaderInfo rayQueryShaderInfo = {};
-  ShaderModuleData rayQueryModuleData = {};
+  ShaderModuleData 
+  rayQueryModuleData = {};
   if (pipelineInfo->shaderLibrary.codeSize > 0) {
     rayQueryModuleData.binCode = pipelineInfo->shaderLibrary;
     rayQueryModuleData.binType = BinaryType::Spirv;

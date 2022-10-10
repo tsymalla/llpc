@@ -179,8 +179,6 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
       m_shaderStage = static_cast<ShaderStage>(shaderStage);
       m_entryPoint = pipelineShaders.getEntryPoint(m_shaderStage);
       if (m_entryPoint) {
-        LLPC_OUTS(m_shaderStage);
-        m_entryPoint->dump();
         processShader(&shaderInputs);
       }
     }
@@ -418,7 +416,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
 
   // For each function definition...
   for (Function &func : module) {
-    if (func.isDeclaration() || func.hasFnAttribute(Attribute::NoInline))
+    if (func.isDeclaration())
       continue;
 
     ShaderStage stage = getShaderStage(&func);
@@ -672,7 +670,6 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, argTys, argNames, 0);
 
   Function *origEntryPoint = m_entryPoint;
-  m_entryPoint->dump();
 
   // Create the new function and transfer code and attributes to it.
   Function *entryPoint =
@@ -714,10 +711,7 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   }
 
   // Set Attributes on new function.
-  if (m_shaderStage == ShaderStageCompute) {
-    // Don't mess up function args for non-compute non-inlined functions.
-    setFuncAttrs(entryPoint);
-  }
+  setFuncAttrs(entryPoint);
 
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
@@ -727,18 +721,20 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
 }
 
 void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage) {
+  if (function->hasFnAttribute(Attribute::NoInline) && shaderStage != getShaderStage(function)) {
+    return;
+  }
+
   m_shaderStage = shaderStage;
   auto *origType = function->getFunctionType();
 
   // Determine what args need to be added on to all functions.
   SmallVector<Type *, 20> shaderInputTys;
   SmallVector<std::string, 20> shaderInputNames;
-  uint64_t inRegMask = 0;
+  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());;
   int argOffset = origType->getNumParams();
   const bool isEntryPointForStage = isShaderEntryPoint(function);
   if (shaderStage == ShaderStageCompute || !isEntryPointForStage) {
-    inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
-
     // Create the new function and transfer code and attributes to it.
     Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
 
@@ -752,19 +748,17 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
     for (auto &use : function->uses())
       funcUses.push_back(&use);
     Constant *bitCastFunc = ConstantExpr::getBitCast(newFunc, function->getType());
-    for (Use *use : funcUses)
+    for (Use *use : funcUses) {
       *use = bitCastFunc;
+    }
 
     // Remove original function.
     argOffset = origType->getNumParams();
-      function->eraseFromParent();
+    function->eraseFromParent();
 
     processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
-
-    newFunc->dump();
   } else {
     processCalls(*function, shaderInputTys, shaderInputNames, inRegMask, argOffset);
-    function->dump();
   }
 }
 
@@ -791,6 +785,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
       }
     } else if (func.hasFnAttribute(Attribute::NoInline)) {
       func.setCallingConv(CallingConv::AMDGPU_Gfx);
+      origFuncs.push_back(&func);
     } else {
       origFuncs.push_back(&func);
     }
@@ -815,9 +810,10 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
   // - a compute pipeline with non-inlined functions;
   // - a compute pipeline with calls to library functions;
   // - a compute library.
-  // - a forced non-inlined call.
+  // - a NoInline call.
   // We need to scan the code and modify each call to append the extra args.
   IRBuilder<> builder(func.getContext());
+
   for (BasicBlock &block : func) {
     // Use early increment iterator, so we can safely erase the instruction.
     for (Instruction &inst : make_early_inc_range(block)) {
@@ -834,7 +830,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           continue;
       } else if (call->isInlineAsm()) {
         continue;
-      } 
+      }
       // Build a new arg list, made of the ABI args shared by all functions (user data and hardware shader
       // inputs), plus the original args on the call.
       SmallVector<Type *, 20> argTys;
@@ -843,41 +839,69 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         argTys.push_back(call->getArgOperand(idx)->getType());
         args.push_back(call->getArgOperand(idx));
       }
-      
-      if (m_shaderStage == ShaderStageCompute || (!isShaderEntryPoint(&func) && !func.hasFnAttribute(Attribute::NoInline))) {
+
+      if (m_shaderStage == ShaderStageCompute || func.hasFnAttribute(Attribute::NoInline)) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           argTys.push_back(func.getArg(idx + argOffset)->getType());
           args.push_back(func.getArg(idx + argOffset));
         }
       }
 
-      // Get the new called value as a bitcast of the old called value. If the old called value is already
-      // the inverse bitcast, just drop that bitcast.
-      // If the old called value was a function declaration, we did not insert a bitcast
-      FunctionType *calledTy = FunctionType::get(call->getType(), argTys, false);
-      builder.SetInsertPoint(call);
-      Type *calledPtrTy = calledTy->getPointerTo(calledVal->getType()->getPointerAddressSpace());
-      auto bitCast = dyn_cast<BitCastOperator>(calledVal);
-      Value *newCalledVal = nullptr;
-      if (bitCast && bitCast->getOperand(0)->getType() == calledPtrTy)
-        newCalledVal = bitCast->getOperand(0);
-      else
-        newCalledVal = builder.CreateBitCast(calledVal, calledPtrTy);
-      // Create the call.
-      CallInst *newCall = builder.CreateCall(calledTy, newCalledVal, args);
-      newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
+      if (call->getCalledFunction()->hasFnAttribute(Attribute::NoInline)) {
+        // Fixup the call with the entry point args.
+        builder.SetInsertPoint(call);
 
-      // Mark sgpr arguments as inreg
-      if (m_shaderStage == ShaderStageCompute || !isShaderEntryPoint(&func)) {
-        for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
-          if ((inRegMask >> idx) & 1)
-            newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+        SmallVector<Type *, 20> newCallArgTys;
+        SmallVector<Value *, 20> newCallArgs;
+
+        for (unsigned idx = 0; idx != call->arg_size(); ++idx) {
+          newCallArgTys.push_back(call->getArgOperand(idx)->getType());
+          newCallArgs.push_back(call->getArgOperand(idx));
         }
-      }
 
-      // Replace and erase the old one.
-      call->replaceAllUsesWith(newCall);
-      call->eraseFromParent();
+        Function *entryPoint = call->getCaller();
+        for (unsigned idx = 0; idx != entryPoint->arg_size(); ++idx) {
+          newCallArgTys.push_back(entryPoint->getArg(idx)->getType());
+          newCallArgs.push_back(entryPoint->getArg(idx));
+        }
+        
+        FunctionType *calledTy = FunctionType::get(call->getType(), newCallArgTys, false);
+        builder.SetInsertPoint(call);
+
+        CallInst *newCall = builder.CreateCall(calledTy, call->getCalledFunction(), newCallArgs);
+        newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
+
+        call->replaceAllUsesWith(newCall);
+        call->eraseFromParent();
+      } else {
+        // Get the new called value as a bitcast of the old called value. If the old called value is already
+        // the inverse bitcast, just drop that bitcast.
+        // If the old called value was a function declaration, we did not insert a bitcast
+        FunctionType *calledTy = FunctionType::get(call->getType(), argTys, false);
+        builder.SetInsertPoint(call);
+        Type *calledPtrTy = calledTy->getPointerTo(calledVal->getType()->getPointerAddressSpace());
+        auto bitCast = dyn_cast<BitCastOperator>(calledVal);
+        Value *newCalledVal = nullptr;
+        if (bitCast && bitCast->getOperand(0)->getType() == calledPtrTy)
+          newCalledVal = bitCast->getOperand(0);
+        else
+          newCalledVal = builder.CreateBitCast(calledVal, calledPtrTy);
+        // Create the call.
+        CallInst *newCall = builder.CreateCall(calledTy, newCalledVal, args);
+        newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
+
+        // Mark sgpr arguments as inreg
+        if (m_shaderStage == ShaderStageCompute) {
+          for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+            if ((inRegMask >> idx) & 1)
+              newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+          }
+        }
+
+        // Replace and erase the old one.
+        call->replaceAllUsesWith(newCall);
+        call->eraseFromParent();
+      }
     }
   }
 }
