@@ -419,6 +419,8 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     if (func.isDeclaration())
       continue;
 
+    func.dump();
+
     ShaderStage stage = getShaderStage(&func);
     auto userDataUsage = getUserDataUsage(stage);
 
@@ -427,7 +429,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     AddressExtender addressExtender(&func);
     if (userDataUsage->spillTable.entryArgIdx != 0) {
       builder.SetInsertPoint(addressExtender.getFirstInsertionPt());
-      Argument *arg = getFunctionArgument(&func, userDataUsage->spillTable.entryArgIdx);
+      Argument *arg = getFunctionArgumentWithOffset(&func, userDataUsage->spillTable.entryArgIdx);
       spillTable = addressExtender.extend(arg, builder.getInt32(HighAddrPc),
                                           builder.getInt8Ty()->getPointerTo(ADDR_SPACE_CONST), builder);
     }
@@ -448,7 +450,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
         if (pushConstOffset.entryArgIdx) {
           // This offset into the push constant is unspilled. Replace the loads with the entry arg, with a
           // bitcast. (We know that all loads are non-aggregates of the same size, so we can bitcast.)
-          Argument *arg = getFunctionArgument(&func, pushConstOffset.entryArgIdx);
+          Argument *arg = getFunctionArgumentWithOffset(&func, pushConstOffset.entryArgIdx);
           for (Instruction *&load : pushConstOffset.users) {
             if (load && load->getFunction() == &func) {
               builder.SetInsertPoint(load);
@@ -519,7 +521,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
         continue;
       if (rootDescriptor.entryArgIdx != 0) {
         // The root descriptor is unspilled, and uses an entry arg.
-        Argument *arg = getFunctionArgument(&func, rootDescriptor.entryArgIdx);
+        Argument *arg = getFunctionArgumentWithOffset(&func, rootDescriptor.entryArgIdx);
         for (Instruction *&call : rootDescriptor.users) {
           if (call && call->getFunction() == &func) {
             call->replaceAllUsesWith(arg);
@@ -592,7 +594,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
 
             if (!isDescTableSpilled) {
               // The descriptor set is unspilled, and uses an entry arg.
-              descTableVal = getFunctionArgument(&func, descriptorTable.entryArgIdx);
+              descTableVal = getFunctionArgumentWithOffset(&func, descriptorTable.entryArgIdx);
               if (isa<ConstantInt>(highHalf)) {
                 // Set builder to insert the 32-to-64 extension code at the start of the function.
                 builder.SetInsertPoint(addressExtender.getFirstInsertionPt());
@@ -635,7 +637,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
           // it with UndefValue.
           arg = UndefValue::get(specialUserData.users[0]->getType());
         } else {
-          arg = getFunctionArgument(&func, specialUserData.entryArgIdx);
+          arg = getFunctionArgumentWithOffset(&func, specialUserData.entryArgIdx);
         }
         for (Instruction *&inst : specialUserData.users) {
           if (inst && inst->getFunction() == &func) {
@@ -659,6 +661,14 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
   }
 }
 
+void PatchEntryPointMutate::fixShaderStage(llvm::Function *function, ShaderStage stage) {
+  ShaderStage actualStage = getShaderStage(function);
+  if (actualStage != stage) {
+    m_shaderStage = actualStage;
+  } else {
+    m_shaderStage = stage;
+  }
+}
 // =====================================================================================================================
 // Process a single shader
 //
@@ -670,6 +680,7 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, argTys, argNames, 0);
 
   Function *origEntryPoint = m_entryPoint;
+  processFunc(shaderInputs, origEntryPoint, m_shaderStage);
 
   // Create the new function and transfer code and attributes to it.
   Function *entryPoint =
@@ -716,25 +727,23 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
   
-  processFunc(shaderInputs, entryPoint, m_shaderStage);
   processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
 }
 
 void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage) {
-  if (function->hasFnAttribute(Attribute::NoInline) && shaderStage != getShaderStage(function)) {
-    return;
-  }
+  fixShaderStage(function, shaderStage);
 
-  m_shaderStage = shaderStage;
   auto *origType = function->getFunctionType();
 
   // Determine what args need to be added on to all functions.
   SmallVector<Type *, 20> shaderInputTys;
   SmallVector<std::string, 20> shaderInputNames;
-  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());;
+  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
   int argOffset = origType->getNumParams();
+  int origNumArgs = argOffset;
   const bool isEntryPointForStage = isShaderEntryPoint(function);
-  if (shaderStage == ShaderStageCompute || !isEntryPointForStage) {
+  Function *funcToProcess = function;
+  if (m_shaderStage == ShaderStageCompute || !isEntryPointForStage) {
     // Create the new function and transfer code and attributes to it.
     Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
 
@@ -755,11 +764,11 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
     // Remove original function.
     argOffset = origType->getNumParams();
     function->eraseFromParent();
-
-    processCalls(*newFunc, shaderInputTys, shaderInputNames, inRegMask, argOffset);
-  } else {
-    processCalls(*function, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+    funcToProcess = newFunc;
+    noInlineFuncArgOffsets[funcToProcess] = origNumArgs;
   }
+
+  processCalls(*funcToProcess, shaderInputTys, shaderInputNames, inRegMask, argOffset);
 }
 
 // =====================================================================================================================
@@ -769,8 +778,6 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
 // @param [in/out] module : Module
 // Exclude an entry point.
 void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage, Function *entryPoint) {
-  m_shaderStage = shaderStage;
-
   // We no longer support compute shader fixed layout required before PAL interface version 624.
   if (m_pipelineState->getLgcContext()->getPalAbiVersion() < 624)
     report_fatal_error("Compute shader not supported before PAL version 624");
@@ -778,23 +785,23 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
   // Process each function definition.
   SmallVector<Function *, 4> origFuncs;
   for (Function &func : module) {
-    if (func.isDeclaration()) {
-      if (!func.isIntrinsic() && !func.getName().startswith(lgcName::InternalCallPrefix)) {
-        // This is the declaration of a callable function that is defined in a different module.
-        func.setCallingConv(CallingConv::AMDGPU_Gfx);
+    if (shaderStage == ShaderStageCompute) {
+      if (func.isDeclaration()) {
+        if (!func.isIntrinsic() && !func.getName().startswith(lgcName::InternalCallPrefix)) {
+          // This is the declaration of a callable function that is defined in a different module.
+          func.setCallingConv(CallingConv::AMDGPU_Gfx);
+        }
+      } else if (&func != entryPoint) {
+        origFuncs.push_back(&func);
       }
-    } else if (func.hasFnAttribute(Attribute::NoInline)) {
+    } else if (!processedNoInlineFuncs[&func] && func.hasFnAttribute(Attribute::NoInline) && getShaderStage(&func) == shaderStage) {
       func.setCallingConv(CallingConv::AMDGPU_Gfx);
       origFuncs.push_back(&func);
-    } else {
-      origFuncs.push_back(&func);
+      processedNoInlineFuncs[&func] = true;
     }
   }
 
   for (Function *origFunc : origFuncs) {
-    if (entryPoint && origFunc == entryPoint)
-      continue;
-
     processFunc(shaderInputs, origFunc, shaderStage);
   }
 }

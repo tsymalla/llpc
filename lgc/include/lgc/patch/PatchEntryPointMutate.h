@@ -35,7 +35,9 @@
 #include "lgc/patch/ShaderInputs.h"
 #include "lgc/state/PipelineShaders.h"
 #include "lgc/state/PipelineState.h"
+#include "lgc/util/Internal.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace lgc {
 
@@ -51,6 +53,17 @@ public:
   static llvm::StringRef name() { return "Patch LLVM for entry-point mutation"; }
 
 private:
+  std::map<llvm::Function *, bool> processedNoInlineFuncs;
+  llvm::SmallDenseMap<llvm::Function *, std::size_t> noInlineFuncArgOffsets;
+  llvm::Argument *getFunctionArgumentWithOffset(llvm::Function *func, unsigned idx) {
+    std::size_t offset = 0;
+    if (func) {
+      offset = noInlineFuncArgOffsets[func];
+    }
+
+    return getFunctionArgument(func, idx + offset);
+  }
+
   // A shader entry-point user data argument
   struct UserDataArg {
     UserDataArg(llvm::Type *argTy, const llvm::Twine &name,
@@ -113,6 +126,7 @@ private:
   // Fix up user data uses.
   void fixupUserDataUses(llvm::Module &module);
 
+  void fixShaderStage(llvm::Function *function, ShaderStage stage);
   void processShader(ShaderInputs *shaderInputs);
   void processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage);
   void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage, llvm::Function *entryPoint = nullptr);
