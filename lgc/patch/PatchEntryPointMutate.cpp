@@ -253,7 +253,6 @@ void PatchEntryPointMutate::gatherUserDataUsage(Module *module) {
   for (Function &func : *module) {
     if (!func.isDeclaration())
       continue;
-
     if (func.getName().startswith(lgcName::SpillTable)) {
       for (User *user : func.users()) {
         CallInst *call = cast<CallInst>(user);
@@ -418,8 +417,6 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
   for (Function &func : module) {
     if (func.isDeclaration())
       continue;
-
-    func.dump();
 
     ShaderStage stage = getShaderStage(&func);
     auto userDataUsage = getUserDataUsage(stage);
@@ -614,6 +611,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
 
             // Now we want to extend the loaded 32-bit value to a 64-bit pointer, using either PC or the provided
             // high half.
+
             descTableVal = addressExtender.extend(descTableVal, highHalf, ptrType, builder);
             addrExtMap[isDescTableSpilled].insert({highHalf, descTableVal});
           }
@@ -738,7 +736,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   // Determine what args need to be added on to all functions.
   SmallVector<Type *, 20> shaderInputTys;
   SmallVector<std::string, 20> shaderInputNames;
-  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, origType->getNumParams());
+  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, 0);
   int argOffset = origType->getNumParams();
   int origNumArgs = argOffset;
   const bool isEntryPointForStage = isShaderEntryPoint(function);

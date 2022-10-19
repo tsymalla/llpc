@@ -195,7 +195,7 @@ bool PatchInOutImportExport::runImpl(Module &module, PipelineShadersResult &pipe
 
   // Process non-entry-point shaders
   for (Function &func : module) {
-    if (func.isDeclaration())
+    if (func.isDeclaration() || func.hasFnAttribute(Attribute::NoInline))
       continue;
     auto shaderStage = getShaderStage(&func);
     if (shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(shaderStage))
@@ -216,7 +216,6 @@ bool PatchInOutImportExport::runImpl(Module &module, PipelineShadersResult &pipe
   m_exportCalls.clear();
 
   m_pipelineSysValues.clear();
-
   return true;
 }
 
