@@ -678,7 +678,6 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, argTys, argNames, 0);
 
   Function *origEntryPoint = m_entryPoint;
-  processFunc(shaderInputs, origEntryPoint, m_shaderStage);
 
   // Create the new function and transfer code and attributes to it.
   Function *entryPoint =
@@ -725,7 +724,11 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
   
+  // We have all entry point arguments when we reach this point, so all NoInline funcs 
+  // can get the entry point args as well.
+  processFunc(shaderInputs, entryPoint, m_shaderStage);
   processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
+  entryPoint->dump();
 }
 
 void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage) {
@@ -751,6 +754,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
     setFuncAttrs(newFunc);
 
     // Change any uses of the old function to a bitcast of the new function.
+
     SmallVector<Use *, 4> funcUses;
     for (auto &use : function->uses())
       funcUses.push_back(&use);
@@ -865,6 +869,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         }
 
         Function *entryPoint = call->getCaller();
+        entryPoint->dump();
         for (unsigned idx = 0; idx != entryPoint->arg_size(); ++idx) {
           newCallArgTys.push_back(entryPoint->getArg(idx)->getType());
           newCallArgs.push_back(entryPoint->getArg(idx));
