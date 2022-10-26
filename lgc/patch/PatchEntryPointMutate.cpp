@@ -728,7 +728,6 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   // can get the entry point args as well.
   processFunc(shaderInputs, entryPoint, m_shaderStage);
   processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
-  entryPoint->dump();
 }
 
 void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage) {
@@ -869,7 +868,6 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         }
 
         Function *entryPoint = call->getCaller();
-        entryPoint->dump();
         for (unsigned idx = 0; idx != entryPoint->arg_size(); ++idx) {
           newCallArgTys.push_back(entryPoint->getArg(idx)->getType());
           newCallArgs.push_back(entryPoint->getArg(idx));

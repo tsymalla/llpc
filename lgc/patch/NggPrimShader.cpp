@@ -2878,9 +2878,6 @@ Value *NggPrimShader::runEsPartial(Module *module, Argument *sysValueStart, Valu
     args.push_back(instanceId);
   }
 
-  for (auto i: args)
-    i->dump();
-  esPartialEntry->dump();
   assert(args.size() == esPartialArgCount); // Must have visit all arguments of ES-partial entry point
 
   CallInst *esPartialCall = m_builder->CreateCall(esPartialEntry, args);
@@ -2950,7 +2947,6 @@ void NggPrimShader::splitEs(Module *module) {
   if (m_nggControl->enableCullDistanceCulling)
     cullDataTy = StructType::get(*m_context, {positionTy, cullDistanceTy});
 
-esEntryPoint->dump();
   // Clone ES
   auto esCullDataFetchFuncTy = FunctionType::get(cullDataTy, esEntryPoint->getFunctionType()->params(), false);
   auto esCullDataFetchFunc = Function::Create(esCullDataFetchFuncTy, esEntryPoint->getLinkage(), "", module);
