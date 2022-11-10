@@ -862,6 +862,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         SmallVector<Type *, 20> newCallArgTys;
         SmallVector<Value *, 20> newCallArgs;
 
+        unsigned originalArgCount = call->arg_size(); 
         for (unsigned idx = 0; idx != call->arg_size(); ++idx) {
           newCallArgTys.push_back(call->getArgOperand(idx)->getType());
           newCallArgs.push_back(call->getArgOperand(idx));
@@ -879,6 +880,12 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         CallInst *newCall = builder.CreateCall(calledTy, call->getCalledFunction(), newCallArgs);
         newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
+        // Make original arguments inreg
+        for (unsigned idx = 0; idx < originalArgCount; ++idx) {
+          //newCall->addParamAttr(idx, Attribute::InReg);
+          call->getCalledFunction()->getArg(idx)->addAttr(Attribute::InReg);
+        }
+        
         call->replaceAllUsesWith(newCall);
         call->eraseFromParent();
       } else {
