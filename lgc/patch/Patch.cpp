@@ -56,15 +56,22 @@
 #include "lgc/state/PipelineState.h"
 #include "lgc/state/TargetInfo.h"
 #include "lgc/util/Debug.h"
+#include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/IPO/ArgumentPromotion.h"
 #include "llvm/Transforms/IPO/ConstantMerge.h"
+#include "llvm/Transforms/IPO/DeadArgumentElimination.h"
 #include "llvm/Transforms/IPO/ForceFunctionAttrs.h"
+#include "llvm/Transforms/IPO/FunctionAttrs.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Transforms/IPO/GlobalOpt.h"
+#include "llvm/Transforms/IPO/IROutliner.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
@@ -202,6 +209,15 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   // with conflicting attributes. Attributes could conflict on GFX10 because PatchSetupTargetFeatures
   // adds a target feature to determine wave32 or wave64.
   passMgr.addPass(PatchSetupTargetFeatures());
+
+  // Direct function call optimization
+  ModulePassManager MPM;
+  MPM.addPass(DeadArgumentEliminationPass());
+  MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(ArgumentPromotionPass()));
+  MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(PostOrderFunctionAttrsPass()));
+  MPM.addPass(GlobalOptPass());
+  MPM.addPass(IROutlinerPass());
+  passMgr.addPass(std::move(MPM));
 
   // Include LLVM IR as a separate section in the ELF binary
   if (pipelineState->getOptions().includeIr)
