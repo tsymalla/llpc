@@ -127,11 +127,11 @@ private:
   void fixupUserDataUses(llvm::Module &module);
 
   void fixShaderStage(llvm::Function *function, ShaderStage stage);
-  void processShader(ShaderInputs *shaderInputs);
-  void processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage);
-  void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage, llvm::Function *entryPoint = nullptr);
+  void processShader(ShaderInputs *shaderInputs, PipelineShadersResult &pipelineShaders);
+  void processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders);
+  void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders, llvm::Function *entryPoint = nullptr);
   void processCalls(llvm::Function &func, llvm::SmallVectorImpl<llvm::Type *> &shaderInputTys,
-                    llvm::SmallVectorImpl<std::string> &shaderInputNames, uint64_t inRegMask, unsigned argOffset);
+                    llvm::SmallVectorImpl<std::string> &shaderInputNames, uint64_t inRegMask, unsigned argOffset, PipelineShadersResult &pipelineShaders);
   void setFuncAttrs(llvm::Function *entryPoint);
 
   uint64_t generateEntryPointArgTys(ShaderInputs *shaderInputs, llvm::SmallVectorImpl<llvm::Type *> &argTys,

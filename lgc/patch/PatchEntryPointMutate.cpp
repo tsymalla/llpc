@@ -179,11 +179,12 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
       m_shaderStage = static_cast<ShaderStage>(shaderStage);
       m_entryPoint = pipelineShaders.getEntryPoint(m_shaderStage);
       if (m_entryPoint) {
-        processShader(&shaderInputs);
+        processShader(&shaderInputs, pipelineShaders);
       }
     }
   } else {
-    processFuncs(&shaderInputs, module, ShaderStageCompute);
+    m_shaderStage = ShaderStageCompute;
+    processFuncs(&shaderInputs, module, ShaderStageCompute, pipelineShaders);
   }
   
   // Fix up shader input uses to use entry args.
@@ -216,6 +217,11 @@ void PatchEntryPointMutate::setupComputeWithCalls(Module *module) {
   // We have a compute pipeline. Check whether there are any non-shader-entry-point functions (other than lgc.*
   // functions and intrinsics).
   for (Function &func : *module) {
+    if (func.isNoInline()) {
+      m_usesCalls = true;
+      return;
+    }
+
     if (func.isDeclaration() && func.getIntrinsicID() == Intrinsic::not_intrinsic &&
         !func.getName().startswith(lgcName::InternalCallPrefix) && !func.user_empty()) {
       m_usesCalls = true;
@@ -660,6 +666,9 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
 }
 
 void PatchEntryPointMutate::fixShaderStage(llvm::Function *function, ShaderStage stage) {
+  if (function->isDeclaration())
+    return;
+  
   ShaderStage actualStage = getShaderStage(function);
   if (actualStage != stage) {
     m_shaderStage = actualStage;
@@ -667,11 +676,12 @@ void PatchEntryPointMutate::fixShaderStage(llvm::Function *function, ShaderStage
     m_shaderStage = stage;
   }
 }
+
 // =====================================================================================================================
 // Process a single shader
 //
 // @param shaderInputs : ShaderInputs object representing hardware-provided shader inputs
-void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
+void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs, PipelineShadersResult &pipelineShaders) {
   // Create new entry-point from the original one
   SmallVector<Type *, 8> argTys;
   SmallVector<std::string, 8> argNames;
@@ -726,11 +736,11 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs) {
   
   // We have all entry point arguments when we reach this point, so all NoInline funcs 
   // can get the entry point args as well.
-  processFunc(shaderInputs, entryPoint, m_shaderStage);
-  processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, entryPoint);
+  processFunc(shaderInputs, entryPoint, m_shaderStage, pipelineShaders);
+  processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, pipelineShaders, entryPoint);
 }
 
-void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage) {
+void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders) {
   fixShaderStage(function, shaderStage);
 
   auto *origType = function->getFunctionType();
@@ -746,7 +756,6 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   if (m_shaderStage == ShaderStageCompute || !isEntryPointForStage) {
     // Create the new function and transfer code and attributes to it.
     Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
-
     newFunc->setCallingConv(isEntryPointForStage && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
                                                                                         : CallingConv::AMDGPU_Gfx);
 
@@ -769,7 +778,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
     noInlineFuncArgOffsets[funcToProcess] = origNumArgs;
   }
 
-  processCalls(*funcToProcess, shaderInputTys, shaderInputNames, inRegMask, argOffset);
+  processCalls(*funcToProcess, shaderInputTys, shaderInputNames, inRegMask, argOffset, pipelineShaders);
 }
 
 // =====================================================================================================================
@@ -778,7 +787,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
 // @param shaderInputs : ShaderInputs object representing hardware-provided shader inputs
 // @param [in/out] module : Module
 // Exclude an entry point.
-void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage, Function *entryPoint) {
+void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &module, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders, Function *entryPoint) {
   // We no longer support compute shader fixed layout required before PAL interface version 624.
   if (m_pipelineState->getLgcContext()->getPalAbiVersion() < 624)
     report_fatal_error("Compute shader not supported before PAL version 624");
@@ -793,9 +802,14 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
           func.setCallingConv(CallingConv::AMDGPU_Gfx);
         }
       } else if (&func != entryPoint) {
+        if (func.isNoInline()) {
+          func.setCallingConv(CallingConv::AMDGPU_Gfx);
+          processedNoInlineFuncs[&func] = true;
+        }
+
         origFuncs.push_back(&func);
       }
-    } else if (!processedNoInlineFuncs[&func] && func.hasFnAttribute(Attribute::NoInline) && getShaderStage(&func) == shaderStage) {
+    } else if (!processedNoInlineFuncs[&func] && func.isNoInline() && getShaderStage(&func) == shaderStage) {
       func.setCallingConv(CallingConv::AMDGPU_Gfx);
       origFuncs.push_back(&func);
       processedNoInlineFuncs[&func] = true;
@@ -803,7 +817,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
   }
 
   for (Function *origFunc : origFuncs) {
-    processFunc(shaderInputs, origFunc, shaderStage);
+    processFunc(shaderInputs, origFunc, shaderStage, pipelineShaders);
   }
 }
 
@@ -813,7 +827,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
 // @param [in/out] module : Module
 void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *> &shaderInputTys,
                                          SmallVectorImpl<std::string> &shaderInputNames, uint64_t inRegMask,
-                                         unsigned argOffset) {
+                                         unsigned argOffset, PipelineShadersResult &pipelineShaders) {
   // This is one of:
   // - a compute pipeline with non-inlined functions;
   // - a compute pipeline with calls to library functions;
@@ -839,6 +853,8 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       } else if (call->isInlineAsm()) {
         continue;
       }
+
+      call->dump();
       // Build a new arg list, made of the ABI args shared by all functions (user data and hardware shader
       // inputs), plus the original args on the call.
       SmallVector<Type *, 20> argTys;
@@ -848,14 +864,14 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
 
-      if (m_shaderStage == ShaderStageCompute || func.hasFnAttribute(Attribute::NoInline)) {
+      if (m_shaderStage == ShaderStageCompute || func.isNoInline()) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           argTys.push_back(func.getArg(idx + argOffset)->getType());
           args.push_back(func.getArg(idx + argOffset));
         }
       }
 
-      if (call->getCalledFunction()->hasFnAttribute(Attribute::NoInline)) {
+      if (call->getCalledFunction()->isNoInline()) {
         // Fixup the call with the entry point args.
         builder.SetInsertPoint(call);
 
@@ -868,11 +884,14 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           newCallArgs.push_back(call->getArgOperand(idx));
         }
 
-        Function *entryPoint = call->getCaller();
+        Function *entryPoint = pipelineShaders.getEntryPoint(lgc::getShaderStage(call->getCaller()));
         for (unsigned idx = 0; idx != entryPoint->arg_size(); ++idx) {
           newCallArgTys.push_back(entryPoint->getArg(idx)->getType());
           newCallArgs.push_back(entryPoint->getArg(idx));
         }
+
+        for (auto *Arg : newCallArgs)
+          Arg->dump();
         
         FunctionType *calledTy = FunctionType::get(call->getType(), newCallArgTys, false);
         builder.SetInsertPoint(call);
