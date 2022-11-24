@@ -193,7 +193,7 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   // Fix up user data uses to use entry args.
   fixupUserDataUses(*m_module);
   m_userDataUsage.clear();
-
+  
   return true;
 }
 
@@ -217,11 +217,6 @@ void PatchEntryPointMutate::setupComputeWithCalls(Module *module) {
   // We have a compute pipeline. Check whether there are any non-shader-entry-point functions (other than lgc.*
   // functions and intrinsics).
   for (Function &func : *module) {
-    if (func.isNoInline()) {
-      m_usesCalls = true;
-      return;
-    }
-
     if (func.isDeclaration() && func.getIntrinsicID() == Intrinsic::not_intrinsic &&
         !func.getName().startswith(lgcName::InternalCallPrefix) && !func.user_empty()) {
       m_usesCalls = true;
@@ -733,6 +728,10 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs, PipelineSh
 
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
+
+  // Copy entry point arguments
+  for (Argument &Arg : entryPoint->args())
+    entryPointArgs[m_shaderStage].push_back(&Arg);
   
   // We have all entry point arguments when we reach this point, so all NoInline funcs 
   // can get the entry point args as well.
@@ -854,7 +853,6 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         continue;
       }
 
-      call->dump();
       // Build a new arg list, made of the ABI args shared by all functions (user data and hardware shader
       // inputs), plus the original args on the call.
       SmallVector<Type *, 20> argTys;
@@ -884,14 +882,10 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           newCallArgs.push_back(call->getArgOperand(idx));
         }
 
-        Function *entryPoint = pipelineShaders.getEntryPoint(lgc::getShaderStage(call->getCaller()));
-        for (unsigned idx = 0; idx != entryPoint->arg_size(); ++idx) {
-          newCallArgTys.push_back(entryPoint->getArg(idx)->getType());
-          newCallArgs.push_back(entryPoint->getArg(idx));
+        for (Argument *arg: entryPointArgs[m_shaderStage]) {
+          newCallArgTys.push_back(arg->getType());
+          newCallArgs.push_back(arg);
         }
-
-        for (auto *Arg : newCallArgs)
-          Arg->dump();
         
         FunctionType *calledTy = FunctionType::get(call->getType(), newCallArgTys, false);
         builder.SetInsertPoint(call);

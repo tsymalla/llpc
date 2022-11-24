@@ -55,6 +55,8 @@ public:
 private:
   std::map<llvm::Function *, bool> processedNoInlineFuncs;
   llvm::SmallDenseMap<llvm::Function *, std::size_t> noInlineFuncArgOffsets;
+  std::map<ShaderStage, llvm::SmallVector<llvm::Argument *>> entryPointArgs;
+  
   llvm::Argument *getFunctionArgumentWithOffset(llvm::Function *func, unsigned idx) {
     std::size_t offset = 0;
     if (func) {
