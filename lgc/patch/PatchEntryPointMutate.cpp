@@ -193,7 +193,9 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   // Fix up user data uses to use entry args.
   fixupUserDataUses(*m_module);
   m_userDataUsage.clear();
-  
+
+  m_module->dump();
+
   return true;
 }
 
@@ -752,6 +754,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   int origNumArgs = argOffset;
   const bool isEntryPointForStage = isShaderEntryPoint(function);
   Function *funcToProcess = function;
+  
   if (m_shaderStage == ShaderStageCompute || !isEntryPointForStage) {
     // Create the new function and transfer code and attributes to it.
     Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
@@ -882,6 +885,8 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           newCallArgs.push_back(call->getArgOperand(idx));
         }
 
+        call->dump();
+        // erster call schlägt fehl
         for (Argument *arg: entryPointArgs[m_shaderStage]) {
           newCallArgTys.push_back(arg->getType());
           newCallArgs.push_back(arg);

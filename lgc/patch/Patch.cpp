@@ -216,7 +216,7 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(ArgumentPromotionPass()));
   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(PostOrderFunctionAttrsPass()));
   MPM.addPass(GlobalOptPass());
-  MPM.addPass(IROutlinerPass());
+  //MPM.addPass(IROutlinerPass());
   passMgr.addPass(std::move(MPM));
 
   // Include LLVM IR as a separate section in the ELF binary
