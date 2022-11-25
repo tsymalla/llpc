@@ -194,8 +194,6 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   fixupUserDataUses(*m_module);
   m_userDataUsage.clear();
 
-  m_module->dump();
-
   return true;
 }
 
@@ -757,11 +755,17 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   
   if (m_shaderStage == ShaderStageCompute || !isEntryPointForStage) {
     // Create the new function and transfer code and attributes to it.
-    Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, 0, true);
+    uint64_t inRegMaskToUse = m_shaderStage == ShaderStageCompute ? inRegMask : 0;
+    Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMaskToUse, true);
     newFunc->setCallingConv(isEntryPointForStage && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
                                                                                         : CallingConv::AMDGPU_Gfx);
 
     setFuncAttrs(newFunc);
+
+    if (m_shaderStage == ShaderStageCompute) {
+      for (Argument &Arg : newFunc->args())
+        entryPointArgs[m_shaderStage].push_back(&Arg);
+    }
 
     // Change any uses of the old function to a bitcast of the new function.
 
@@ -865,7 +869,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
 
-      if (m_shaderStage == ShaderStageCompute || func.isNoInline()) {
+      if (!func.isDeclaration() && (m_shaderStage == ShaderStageCompute || func.isNoInline())) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           argTys.push_back(func.getArg(idx + argOffset)->getType());
           args.push_back(func.getArg(idx + argOffset));
@@ -885,7 +889,6 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           newCallArgs.push_back(call->getArgOperand(idx));
         }
 
-        call->dump();
         // erster call schlägt fehl
         for (Argument *arg: entryPointArgs[m_shaderStage]) {
           newCallArgTys.push_back(arg->getType());
@@ -902,6 +905,13 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         for (unsigned idx = 0; idx < originalArgCount; ++idx) {
           //newCall->addParamAttr(idx, Attribute::InReg);
           call->getCalledFunction()->getArg(idx)->addAttr(Attribute::InReg);
+        }
+
+        if (m_shaderStage == ShaderStageCompute) {
+          for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
+            if ((inRegMask >> idx) & 1)
+              newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
+          }
         }
         
         call->replaceAllUsesWith(newCall);
