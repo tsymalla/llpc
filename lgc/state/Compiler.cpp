@@ -33,6 +33,7 @@
 #include "lgc/patch/Patch.h"
 #include "lgc/state/PipelineShaders.h"
 #include "lgc/state/PipelineState.h"
+#include "lgc/state/ShaderStage.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/Linker/Linker.h"
@@ -67,6 +68,14 @@ void Pipeline::markShaderEntryPoint(Function *func, ShaderStage stage) {
   func->setLinkage(GlobalValue::ExternalLinkage);
   func->setDLLStorageClass(GlobalValue::DLLExportStorageClass);
   setShaderStage(func, stage);
+}
+
+void Pipeline::setShaderStageToFunc(Function *func, ShaderStage stage) {
+  setShaderStage(func, stage);
+}
+
+ShaderStage Pipeline::getShaderStageFromFunc(Function *func) {
+  return getShaderStage(func);
 }
 
 // =====================================================================================================================

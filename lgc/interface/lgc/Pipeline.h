@@ -683,6 +683,10 @@ public:
   // @param stage : Shader stage
   static void markShaderEntryPoint(llvm::Function *func, ShaderStage stage);
 
+  static void setShaderStageToFunc(llvm::Function *func, ShaderStage stage);
+
+  static ShaderStage getShaderStageFromFunc(llvm::Function *func);
+
   // Link the individual shader modules into a single pipeline module. The front-end must have
   // finished calling Builder::Create* methods and finished building the IR. In the case that
   // there are multiple shader modules, they are all freed by this call, and the linked pipeline

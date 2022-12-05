@@ -35,8 +35,10 @@
 #include "llpcSpirvLowerUtil.h"
 #include "lgc/Builder.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Use.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -769,6 +771,123 @@ void SpirvLowerGlobal::lowerInput() {
     input->replaceAllUsesWith(proxy);
     input->eraseFromParent();
   }
+
+  auto IP = m_builder->GetInsertPoint();
+  SmallVector<Function *, 2> funcsToProcess;
+
+  for (Function &function : *m_module)
+    if (function.isNoInline())
+      funcsToProcess.push_back(&function);
+    
+  while (!funcsToProcess.empty()) {
+    Function &function = *funcsToProcess.back();
+
+    // Clone function and add the proxies to the argument list
+    SmallVector<Type *, 8> argTys;
+    SmallVector<Value *, 8> args;
+
+    function.dump();
+    for (Argument &arg: function.args()) {
+      args.push_back(&arg);
+      argTys.push_back(arg.getType());
+    }
+
+    for (auto input : m_inputProxyMap) {
+      args.push_back(input.second);
+      argTys.push_back(input.second->getType());
+    }
+
+    FunctionType *cloneFuncTy = FunctionType::get(function.getReturnType(), argTys, false);
+    Function *clone = Function::Create(cloneFuncTy, function.getLinkage(), "", function.getParent());
+    clone->setCallingConv(function.getCallingConv());
+    clone->takeName(&function);
+    clone->setSubprogram(function.getSubprogram());
+    clone->setDLLStorageClass(function.getDLLStorageClass());
+    
+    // Move the basic blocks
+    while (!function.empty()) {
+      BasicBlock *block = &function.front();
+      block->removeFromParent();
+      block->insertInto(clone);
+    }
+
+    lgc::Pipeline::setShaderStageToFunc(clone, lgc::Pipeline::getShaderStageFromFunc(&function));
+
+    // Name the argments
+    for (unsigned idx = 0; idx != args.size(); ++idx) {
+      Argument *arg = clone->getArg(idx);
+      auto *oldArg = args[idx];
+      arg->setName(oldArg->getName() + ".arg");
+    }
+
+    // Replace all users of non-proxy args with the clone argment
+    for (unsigned idx = 0; idx < function.arg_size(); ++idx) {
+      Argument *arg = clone->getArg(idx);
+      auto *oldArg = args[idx];
+
+      for (auto *user : oldArg->users()) {
+        user->dump();
+        if (auto *inst = dyn_cast<Instruction>(user))
+          if (inst->getFunction() == clone && !isa<CallInst>(inst)) {
+            user->replaceUsesOfWith(oldArg, arg);
+            user->dump();
+          }
+      }
+    }
+
+    // Replace all calls to the old function with calls to the new function
+    for (auto *user : function.users()) {
+      assert(isa<CallInst>(user));
+      auto oldCall = cast<CallInst>(user);
+      m_builder->SetInsertPoint(oldCall);
+
+      SmallVector<Value *, 8> newArgs;
+      for (size_t i = 0; i < oldCall->arg_size(); ++i)
+        newArgs.push_back(oldCall->getArgOperand(i));
+
+      for (auto input : m_inputProxyMap)
+        newArgs.push_back(input.second);
+
+      CallInst *call = m_builder->CreateCall(clone, newArgs);
+      call->setCallingConv(oldCall->getCallingConv());
+      user->replaceAllUsesWith(call);
+      oldCall->eraseFromParent();
+    }
+
+    // Replace all uses of the original proxy inside the function with the new arg.
+    std::unordered_map<llvm::Value *, SmallVector<Instruction *, 4>> proxyUsers;
+    for (auto input : m_inputProxyMap) {
+      for (auto *user : input.second->users()) {
+        if (auto *inst = dyn_cast<Instruction>(user)) {
+          if (isa<CallInst>(inst) || inst->getFunction() != clone)
+            continue;
+
+          proxyUsers[input.second].push_back(inst);
+        }
+      }
+    }
+
+    size_t idx = function.arg_size();
+    for (auto input : m_inputProxyMap) {
+      auto &users = proxyUsers[input.second];
+      while (!users.empty()) {
+          auto &user = users.back();
+          // Replace all users referring to the entry point proxy with the new arg
+          user->replaceUsesOfWith(input.second, clone->getArg(idx));
+          users.pop_back();
+      }
+
+      ++idx;
+    }
+
+    m_module->dump();
+    function.dropAllReferences();
+    function.eraseFromParent();
+
+    funcsToProcess.pop_back();
+  }
+
+  m_builder->SetInsertPoint(cast<Instruction>(IP));
 }
 
 // =====================================================================================================================

@@ -730,9 +730,10 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs, PipelineSh
   origEntryPoint->eraseFromParent();
 
   // Copy entry point arguments
-  for (Argument &Arg : entryPoint->args())
+  for (Argument &Arg : entryPoint->args()) {
     entryPointArgs[m_shaderStage].push_back(&Arg);
-  
+  }
+
   // We have all entry point arguments when we reach this point, so all NoInline funcs 
   // can get the entry point args as well.
   processFunc(shaderInputs, entryPoint, m_shaderStage, pipelineShaders);
@@ -755,7 +756,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   
   if (m_shaderStage == ShaderStageCompute || !isEntryPointForStage) {
     // Create the new function and transfer code and attributes to it.
-    uint64_t inRegMaskToUse = m_shaderStage == ShaderStageCompute ? inRegMask : 0;
+    uint64_t inRegMaskToUse = inRegMask;
     Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMaskToUse, true);
     newFunc->setCallingConv(isEntryPointForStage && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
                                                                                         : CallingConv::AMDGPU_Gfx);
@@ -883,7 +884,6 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         SmallVector<Type *, 20> newCallArgTys;
         SmallVector<Value *, 20> newCallArgs;
 
-        unsigned originalArgCount = call->arg_size(); 
         for (unsigned idx = 0; idx != call->arg_size(); ++idx) {
           newCallArgTys.push_back(call->getArgOperand(idx)->getType());
           newCallArgs.push_back(call->getArgOperand(idx));
@@ -901,13 +901,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         CallInst *newCall = builder.CreateCall(calledTy, call->getCalledFunction(), newCallArgs);
         newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
-        // Make original arguments inreg
-        for (unsigned idx = 0; idx < originalArgCount; ++idx) {
-          //newCall->addParamAttr(idx, Attribute::InReg);
-          call->getCalledFunction()->getArg(idx)->addAttr(Attribute::InReg);
-        }
-
-        if (m_shaderStage == ShaderStageCompute) {
+        if (m_shaderStage == ShaderStageCompute || inRegMask != 0) {
           for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
             if ((inRegMask >> idx) & 1)
               newCall->addParamAttr(idx + call->arg_size(), Attribute::InReg);
