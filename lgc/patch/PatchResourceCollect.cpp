@@ -141,6 +141,7 @@ bool PatchResourceCollect::runImpl(Module &module, PipelineShadersResult &pipeli
   for (int shaderStage = ShaderStageCountInternal - 1; shaderStage >= 0; --shaderStage) {
     m_entryPoint = pipelineShaders.getEntryPoint(static_cast<ShaderStage>(shaderStage));
     m_shaderStage = static_cast<ShaderStage>(shaderStage);
+
     if (m_entryPoint)
       processShader();
     else if (m_shaderStage == ShaderStageFragment)
@@ -154,7 +155,7 @@ bool PatchResourceCollect::runImpl(Module &module, PipelineShadersResult &pipeli
 
     m_shaderStage = getShaderStage(&func);
     // Skip non-inlined functions.
-    if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage) || func.hasFnAttribute(Attribute::NoInline))
+    if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage) || func.isNoInline())
       continue;
     m_entryPoint = &func;
     processShader();
@@ -1696,6 +1697,9 @@ void PatchResourceCollect::matchGenericInOut() {
     auto &outOrigLocs = inOutUsage.fs.outputOrigLocs;
     if (m_shaderStage == ShaderStageFragment)
       memset(&outOrigLocs, InvalidValue, sizeof(inOutUsage.fs.outputOrigLocs));
+
+    if (inOutUsage.outputMapLocCount > 0)
+      m_entryPoint->dump();
 
     assert(inOutUsage.outputMapLocCount == 0);
 
@@ -3284,7 +3288,11 @@ void PatchResourceCollect::scalarizeForInOutPacking(Module *module) {
       // This is a generic (possibly interpolated) input. Find its uses in {TCS, GS, FS}.
       for (User *user : func.users()) {
         auto call = cast<CallInst>(user);
+        if (call->getFunction()->isNoInline())
+          continue;
+
         ShaderStage shaderStage = m_pipelineShaders->getShaderStage(call->getFunction());
+
         if (m_pipelineState->canPackInput(shaderStage)) {
           // NOTE: Dynamic indexing (location offset or component) in FS is processed to be constant in lower pass.
           assert(!isInterpolant ||

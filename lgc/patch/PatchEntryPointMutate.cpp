@@ -877,6 +877,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         }
       }
 
+      call->dump();
       if (call->getCalledFunction()->isNoInline()) {
         // Fixup the call with the entry point args.
         builder.SetInsertPoint(call);

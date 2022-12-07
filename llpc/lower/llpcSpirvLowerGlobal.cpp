@@ -773,20 +773,21 @@ void SpirvLowerGlobal::lowerInput() {
   }
 
   auto IP = m_builder->GetInsertPoint();
-  SmallVector<Function *, 2> funcsToProcess;
+
+  SmallVector<std::pair<Function *, Function *>, 2> funcsToProcess;
 
   for (Function &function : *m_module)
     if (function.isNoInline())
-      funcsToProcess.push_back(&function);
-    
-  while (!funcsToProcess.empty()) {
-    Function &function = *funcsToProcess.back();
+      funcsToProcess.push_back({ &function, nullptr }); // old func / new func
+  
+  size_t funcIndex = 0;
+  for (auto &functionTuple : reverse(funcsToProcess)) {
+    Function &function = *functionTuple.first;
 
     // Clone function and add the proxies to the argument list
     SmallVector<Type *, 8> argTys;
     SmallVector<Value *, 8> args;
 
-    function.dump();
     for (Argument &arg: function.args()) {
       args.push_back(&arg);
       argTys.push_back(arg.getType());
@@ -799,11 +800,14 @@ void SpirvLowerGlobal::lowerInput() {
 
     FunctionType *cloneFuncTy = FunctionType::get(function.getReturnType(), argTys, false);
     Function *clone = Function::Create(cloneFuncTy, function.getLinkage(), "", function.getParent());
+    functionTuple.second = clone;
+
     clone->setCallingConv(function.getCallingConv());
     clone->takeName(&function);
     clone->setSubprogram(function.getSubprogram());
     clone->setDLLStorageClass(function.getDLLStorageClass());
-    
+    clone->setAttributes(function.getAttributes());
+
     // Move the basic blocks
     while (!function.empty()) {
       BasicBlock *block = &function.front();
@@ -817,41 +821,30 @@ void SpirvLowerGlobal::lowerInput() {
     for (unsigned idx = 0; idx != args.size(); ++idx) {
       Argument *arg = clone->getArg(idx);
       auto *oldArg = args[idx];
-      arg->setName(oldArg->getName() + ".arg");
+      arg->setName(oldArg->getName() + "arg." + std::to_string(funcIndex));
     }
 
     // Replace all users of non-proxy args with the clone argment
+    std::unordered_map<llvm::Value *, SmallVector<Instruction *, 4>> argUsers;
     for (unsigned idx = 0; idx < function.arg_size(); ++idx) {
-      Argument *arg = clone->getArg(idx);
       auto *oldArg = args[idx];
 
       for (auto *user : oldArg->users()) {
-        user->dump();
         if (auto *inst = dyn_cast<Instruction>(user))
           if (inst->getFunction() == clone && !isa<CallInst>(inst)) {
-            user->replaceUsesOfWith(oldArg, arg);
-            user->dump();
+            argUsers[oldArg].push_back(inst);
           }
       }
     }
 
-    // Replace all calls to the old function with calls to the new function
-    for (auto *user : function.users()) {
-      assert(isa<CallInst>(user));
-      auto oldCall = cast<CallInst>(user);
-      m_builder->SetInsertPoint(oldCall);
+    for (unsigned idx = 0; idx < function.arg_size(); ++idx) {
+      auto *oldArg = args[idx];
+      while (!argUsers[oldArg].empty()) {
+        auto &user = argUsers[oldArg].back();
+        user->replaceUsesOfWith(oldArg, clone->getArg(idx));
 
-      SmallVector<Value *, 8> newArgs;
-      for (size_t i = 0; i < oldCall->arg_size(); ++i)
-        newArgs.push_back(oldCall->getArgOperand(i));
-
-      for (auto input : m_inputProxyMap)
-        newArgs.push_back(input.second);
-
-      CallInst *call = m_builder->CreateCall(clone, newArgs);
-      call->setCallingConv(oldCall->getCallingConv());
-      user->replaceAllUsesWith(call);
-      oldCall->eraseFromParent();
+        argUsers[oldArg].pop_back();
+      }
     }
 
     // Replace all uses of the original proxy inside the function with the new arg.
@@ -880,14 +873,72 @@ void SpirvLowerGlobal::lowerInput() {
       ++idx;
     }
 
-    m_module->dump();
-    function.dropAllReferences();
-    function.eraseFromParent();
+    ++funcIndex;
+  }
+
+  while (!funcsToProcess.empty()) {
+    auto &functionTuple = funcsToProcess.back();
+
+    SmallVector<Type *, 8> argTys;
+    SmallVector<Value *, 8> args;
+
+    Function *oldFunc = functionTuple.first;
+    Function *newFunc = functionTuple.second;
+    for (size_t idx = oldFunc->arg_size(); idx < newFunc->arg_size(); ++idx) {
+      args.push_back(newFunc->getArg(idx));
+      argTys.push_back(newFunc->getArg(idx)->getType());
+    }
+
+    // Replace all calls to the old function with calls to the new function
+    SmallVector<CallInst *, 2> oldUsers;
+    for (auto *user : functionTuple.first->users()) {
+      assert(isa<CallInst>(user));
+      auto oldCall = cast<CallInst>(user);
+      oldUsers.push_back(oldCall);
+    }
+
+    while (!oldUsers.empty()) {
+      CallInst *oldCall = oldUsers.back();
+      m_builder->SetInsertPoint(oldCall);
+      bool useEntryPoint = !oldCall->getFunction()->isNoInline();
+
+      SmallVector<Value *, 8> newArgs;
+
+      for (size_t i = 0; i < oldCall->arg_size(); ++i)
+        newArgs.push_back(oldCall->getArgOperand(i));
+
+      if (useEntryPoint) {
+        for (auto &input: m_inputProxyMap)
+          newArgs.push_back(input.second);
+      } else {
+        oldCall->dump();
+        oldCall->getFunction()->dump();
+        int oldCallFuncArgCount = oldCall->getFunction()->arg_size();
+        int proxyCount = m_inputProxyMap.size();
+        int startIndex = oldCallFuncArgCount - proxyCount;
+        for (int i = startIndex; i < oldCallFuncArgCount; ++i)
+          newArgs.push_back(oldCall->getFunction()->getArg(i));
+      }
+
+      functionTuple.second->dump();
+      for (auto &arg: newArgs)
+        arg->dump();
+
+      CallInst *call = m_builder->CreateCall(functionTuple.second, newArgs);
+      call->setCallingConv(oldCall->getCallingConv());
+      oldCall->replaceAllUsesWith(call);
+      oldCall->eraseFromParent();
+      oldUsers.pop_back();
+    }
 
     funcsToProcess.pop_back();
+
+    oldFunc->dropAllReferences();
+    oldFunc->eraseFromParent();
   }
 
   m_builder->SetInsertPoint(cast<Instruction>(IP));
+  m_module->dump();
 }
 
 // =====================================================================================================================
