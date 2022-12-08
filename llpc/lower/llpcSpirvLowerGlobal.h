@@ -77,6 +77,8 @@ private:
 
   void cleanupReturnBlock();
 
+  void passProxyVariablesToFuncs(std::unordered_map<Value *, Value*> &proxyMap);
+  
   llvm::Value *addCallInstForInOutImport(llvm::Type *inOutTy, unsigned addrSpace, llvm::Constant *inOutMeta,
                                          llvm::Value *startLoc, unsigned maxLocOffset, llvm::Value *compIdx,
                                          llvm::Value *vertexIdx, unsigned interpLoc, llvm::Value *interpInfo,
