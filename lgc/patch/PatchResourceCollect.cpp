@@ -1698,9 +1698,6 @@ void PatchResourceCollect::matchGenericInOut() {
     if (m_shaderStage == ShaderStageFragment)
       memset(&outOrigLocs, InvalidValue, sizeof(inOutUsage.fs.outputOrigLocs));
 
-    if (inOutUsage.outputMapLocCount > 0)
-      m_entryPoint->dump();
-
     assert(inOutUsage.outputMapLocCount == 0);
 
     // Update the value of outLocMap for non pack case

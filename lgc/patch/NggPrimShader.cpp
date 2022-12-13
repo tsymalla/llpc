@@ -76,6 +76,8 @@ NggPrimShader::NggPrimShader(PipelineState *pipelineState)
   m_hasTes = m_pipelineState->hasShaderStage(ShaderStageTessEval);
   m_hasGs = m_pipelineState->hasShaderStage(ShaderStageGeometry);
 
+  //m_inlineAttr = Attribute::NoInline;
+
   // NOTE: For NGG GS mode, we change data layout of output vertices. They are grouped by vertex streams now.
   // Vertices belonging to different vertex streams are in different regions of GS-VS ring. Here, we calculate
   // the base offset of each vertex streams and record them. See NggPrimShader::exportGsOutput for detail.
@@ -162,7 +164,7 @@ Function *NggPrimShader::generate(Function *esEntryPoint, Function *gsEntryPoint
     esEntryPoint->setCallingConv(CallingConv::AMDGPU_ES);
     esEntryPoint->setLinkage(GlobalValue::InternalLinkage);
     esEntryPoint->setDLLStorageClass(GlobalValue::DefaultStorageClass);
-    esEntryPoint->addFnAttr(Attribute::AlwaysInline);
+    esEntryPoint->addFnAttr(m_inlineAttr);
   }
 
   if (gsEntryPoint) {
@@ -171,14 +173,14 @@ Function *NggPrimShader::generate(Function *esEntryPoint, Function *gsEntryPoint
     gsEntryPoint->setCallingConv(CallingConv::AMDGPU_GS);
     gsEntryPoint->setLinkage(GlobalValue::InternalLinkage);
     gsEntryPoint->setDLLStorageClass(GlobalValue::DefaultStorageClass);
-    gsEntryPoint->addFnAttr(Attribute::AlwaysInline);
+    gsEntryPoint->addFnAttr(m_inlineAttr);
 
     assert(copyShaderEntryPoint); // Copy shader must be present
     copyShaderEntryPoint->setName(lgcName::NggCopyShaderEntryPoint);
     copyShaderEntryPoint->setCallingConv(CallingConv::AMDGPU_VS);
     copyShaderEntryPoint->setLinkage(GlobalValue::InternalLinkage);
     copyShaderEntryPoint->setDLLStorageClass(GlobalValue::DefaultStorageClass);
-    copyShaderEntryPoint->addFnAttr(Attribute::AlwaysInline);
+    copyShaderEntryPoint->addFnAttr(m_inlineAttr);
   }
 
   // Create NGG LDS manager
@@ -3633,7 +3635,7 @@ Function *NggPrimShader::createGsEmitHandler(Module *module) {
   auto func = Function::Create(funcTy, GlobalValue::InternalLinkage, lgcName::NggGsEmit, module);
 
   func->setCallingConv(CallingConv::C);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *threadIdInSubgroup = argIt++;
@@ -3738,7 +3740,7 @@ Function *NggPrimShader::createGsCutHandler(Module *module) {
   auto func = Function::Create(funcTy, GlobalValue::InternalLinkage, lgcName::NggGsCut, module);
 
   func->setCallingConv(CallingConv::C);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *outVertsPtr = argIt++;
@@ -4066,7 +4068,7 @@ Function *NggPrimShader::createBackfaceCuller(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadNone);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *cullFlag = argIt++;
@@ -4295,7 +4297,7 @@ Function *NggPrimShader::createFrustumCuller(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadNone);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *cullFlag = argIt++;
@@ -4553,7 +4555,7 @@ Function *NggPrimShader::createBoxFilterCuller(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadNone);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *cullFlag = argIt++;
@@ -4778,7 +4780,7 @@ Function *NggPrimShader::createSphereCuller(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadNone);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *cullFlag = argIt++;
@@ -5145,7 +5147,7 @@ Function *NggPrimShader::createSmallPrimFilterCuller(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadNone);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *cullFlag = argIt++;
@@ -5423,7 +5425,7 @@ Function *NggPrimShader::createCullDistanceCuller(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadNone);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *cullFlag = argIt++;
@@ -5503,7 +5505,7 @@ Function *NggPrimShader::createFetchCullingRegister(Module *module) {
 
   func->setCallingConv(CallingConv::C);
   func->addFnAttr(Attribute::ReadOnly);
-  func->addFnAttr(Attribute::AlwaysInline);
+  func->addFnAttr(m_inlineAttr);
 
   auto argIt = func->arg_begin();
   Value *primShaderTableAddrLow = argIt++;

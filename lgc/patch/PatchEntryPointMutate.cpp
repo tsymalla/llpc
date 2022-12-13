@@ -877,8 +877,8 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         }
       }
 
-      call->dump();
-      if (call->getCalledFunction()->isNoInline()) {
+      Function *callee = call->getCalledFunction();
+      if (callee->isNoInline()) {
         // Fixup the call with the entry point args.
         builder.SetInsertPoint(call);
 
@@ -890,7 +890,6 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
           newCallArgs.push_back(call->getArgOperand(idx));
         }
 
-        // erster call schlägt fehl
         for (Argument *arg: entryPointArgs[m_shaderStage]) {
           newCallArgTys.push_back(arg->getType());
           newCallArgs.push_back(arg);
@@ -899,7 +898,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         FunctionType *calledTy = FunctionType::get(call->getType(), newCallArgTys, false);
         builder.SetInsertPoint(call);
 
-        CallInst *newCall = builder.CreateCall(calledTy, call->getCalledFunction(), newCallArgs);
+        CallInst *newCall = builder.CreateCall(calledTy, callee, newCallArgs);
         newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
         if (m_shaderStage == ShaderStageCompute || inRegMask != 0) {

@@ -147,6 +147,7 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   passMgr.addPass(LowerVertexFetch());
   passMgr.addPass(LowerFragColorExport());
   passMgr.addPass(PatchEntryPointMutate());
+  passMgr.addPass(DeadArgumentEliminationPass());
   passMgr.addPass(PatchInitializeWorkgroupMemory());
   passMgr.addPass(PatchInOutImportExport());
 

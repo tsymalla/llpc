@@ -157,6 +157,8 @@ private:
   NggPrimShader(const NggPrimShader &) = delete;
   NggPrimShader &operator=(const NggPrimShader &) = delete;
 
+  llvm::Attribute::AttrKind m_inlineAttr = llvm::Attribute::AlwaysInline;
+
   static unsigned calcVertexCullInfoSizeAndOffsets(PipelineState *pipelineState,
                                                    VertexCullInfoOffsets &vertCullInfoOffsets);
 

@@ -43,6 +43,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include <unordered_map>
 #include <unordered_set>
 
 #define DEBUG_TYPE "llpc-spirv-lower-global"
@@ -258,8 +259,11 @@ bool SpirvLowerGlobal::runImpl(Module &module) {
       lowerInOutInPlace();
     else
       lowerOutput();
-  }
 
+    if (!m_lowerInputInPlace && !m_lowerOutputInPlace) {
+      passProxyVariablesToFuncs();
+    }
+  }
   lowerBufferBlock();
   lowerPushConsts();
   lowerAliasedVal();
@@ -706,7 +710,7 @@ void SpirvLowerGlobal::lowerGlobalVar() {
     globalVar->mutateType(proxy->getType()); // To clear address space for pointer to make replacement valid
     globalVar->replaceAllUsesWith(proxy);
     globalVar->dropAllReferences();
-    globalVar->eraseFromParent();
+    //globalVar->eraseFromParent();
   }
 }
 
@@ -769,10 +773,8 @@ void SpirvLowerGlobal::lowerInput() {
     auto proxy = inputMap.second;
     input->mutateType(proxy->getType()); // To clear address space for pointer to make replacement valid
     input->replaceAllUsesWith(proxy);
-    input->eraseFromParent();
+    //input->eraseFromParent();
   }
-  
-  passProxyVariablesToFuncs(m_inputProxyMap);
 }
 
 // =====================================================================================================================
@@ -870,13 +872,8 @@ void SpirvLowerGlobal::lowerOutput() {
     auto proxy = outputMap.second;
     output->mutateType(proxy->getType()); // To clear address space for pointer to make replacement valid
     output->replaceAllUsesWith(proxy);
-    output->eraseFromParent();
+    //output->eraseFromParent();
   }
-
-  std::unordered_map<Value *, Value*> proxyMap;
-  for (auto &tuple : m_outputProxyMap)
-    proxyMap[tuple.first] = tuple.second;
-  //passProxyVariablesToFuncs(proxyMap);
 }
 
 // =====================================================================================================================
@@ -2075,7 +2072,15 @@ void SpirvLowerGlobal::cleanupReturnBlock() {
     m_retBlock = nullptr;
 }
 
-void SpirvLowerGlobal::passProxyVariablesToFuncs(std::unordered_map<Value *, Value*> &proxyMap) {
+void SpirvLowerGlobal::passProxyVariablesToFuncs() {
+  std::unordered_map<Value *, Value *> proxyMap;
+  for (auto &inputTuple : m_inputProxyMap)
+    proxyMap[inputTuple.first] = inputTuple.second;
+  for (auto &outputTuple : m_outputProxyMap)
+    proxyMap[outputTuple.first] = outputTuple.second;
+  for (auto &globalVarTuple : m_globalVarProxyMap)
+    proxyMap[globalVarTuple.first] = globalVarTuple.second;
+
   auto IP = m_builder->GetInsertPoint();
 
   SmallVector<std::pair<Function *, Function *>, 2> funcsToProcess;
@@ -2216,13 +2221,14 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs(std::unordered_map<Value *, Val
           newArgs.push_back(input.second);
       } else {
         int oldCallFuncArgCount = oldCall->getFunction()->arg_size();
-        int proxyCount = m_inputProxyMap.size();
+        int proxyCount = proxyMap.size();
         int startIndex = oldCallFuncArgCount - proxyCount;
         for (int i = startIndex; i < oldCallFuncArgCount; ++i)
           newArgs.push_back(oldCall->getFunction()->getArg(i));
       }
 
       CallInst *call = m_builder->CreateCall(functionTuple.second, newArgs);
+      assert(call->getCalledFunction());
       call->setCallingConv(oldCall->getCallingConv());
       oldCall->replaceAllUsesWith(call);
       oldCall->eraseFromParent();
@@ -2236,7 +2242,10 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs(std::unordered_map<Value *, Val
   }
 
   m_builder->SetInsertPoint(cast<Instruction>(IP));
-  m_module->dump();
+
+  for (auto proxyTuple: proxyMap) {
+    cast<GlobalVariable>(proxyTuple.first)->eraseFromParent();
+  }
 }
 
 // =====================================================================================================================
