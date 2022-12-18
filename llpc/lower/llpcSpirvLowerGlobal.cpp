@@ -2200,11 +2200,36 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs() {
 
     // All calls to intrinsics need to be adjusted so that they use the arguments 
     // of the current caller instead of the from the old function.
-    // TODO
-    
+    for (auto &BB : *newFunc) {
+      for (auto &I: BB) {
+        if (!isa<CallInst>(I))
+          continue;
+
+        CallInst *CI = cast<CallInst>(&I);
+        if (!CI->getCalledFunction()->isDeclaration())
+          continue;
+
+        for (size_t Idx = 0; Idx < CI->arg_size(); ++Idx) {
+          Value *Arg = CI->getArgOperand(Idx);
+          size_t FuncArgIdx = 0;
+          for (auto &FuncArg : oldFunc->args()) {
+            // Search for the original argument and then map 
+            // it the call operand to the corresponding argument in 
+            // the new function.
+            if (Arg != &FuncArg) {
+              ++FuncArgIdx;
+              continue;
+            }
+
+            CI->setArgOperand(Idx, newFunc->getArg(FuncArgIdx));
+          }
+        }
+      }
+    }
+
     // Replace all calls to the old function with calls to the new function
     SmallVector<CallInst *, 2> oldUsers;
-    for (auto *user : functionTuple.first->users()) {
+    for (auto *user : oldFunc->users()) {
       assert(isa<CallInst>(user));
       auto oldCall = cast<CallInst>(user);
       oldUsers.push_back(oldCall);
