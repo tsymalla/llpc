@@ -201,7 +201,8 @@ Function *lgc::addFunctionArgs(Function *oldFunc, Type *retTy, ArrayRef<Type *> 
   // Also set name of each new arg that comes from old arg.
   for (unsigned idx = 0; idx != argTys.size(); ++idx) {
     Argument *arg = newFunc->getArg(append ? idx + oldFuncTy->getNumParams() : idx);
-    arg->setName(argNames[idx]);
+    std::string name = argNames[idx] + (newFunc->isNoInline() ? ".arg" : "");
+    arg->setName(name);
     if ((inRegMask >> idx) & 1)
       arg->addAttr(Attribute::InReg);
     else if (!oldFuncTy->params().empty())

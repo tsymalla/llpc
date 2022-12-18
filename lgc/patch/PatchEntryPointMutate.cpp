@@ -748,8 +748,8 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   // Determine what args need to be added on to all functions.
   SmallVector<Type *, 20> shaderInputTys;
   SmallVector<std::string, 20> shaderInputNames;
-  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, 0);
   int argOffset = origType->getNumParams();
+  uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, 0);
   int origNumArgs = argOffset;
   const bool isEntryPointForStage = isShaderEntryPoint(function);
   Function *funcToProcess = function;
@@ -780,9 +780,10 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
 
     // Remove original function.
     argOffset = origType->getNumParams();
-    function->eraseFromParent();
     funcToProcess = newFunc;
     noInlineFuncArgOffsets[funcToProcess] = origNumArgs;
+
+    function->eraseFromParent();
   }
 
   processCalls(*funcToProcess, shaderInputTys, shaderInputNames, inRegMask, argOffset, pipelineShaders);
@@ -878,7 +879,8 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
       }
 
       Function *callee = call->getCalledFunction();
-      if (callee->isNoInline()) {
+      // TODO fix
+      if (callee && callee->isNoInline()) {
         // Fixup the call with the entry point args.
         builder.SetInsertPoint(call);
 

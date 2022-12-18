@@ -188,7 +188,9 @@ void SpirvLowerTranslator::translateSpirvToLlvm(const PipelineShaderInfo *shader
       func.removeFnAttr(Attribute::NoInline);
 #endif
 
-    if (!m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
+    // TODO
+    lgc::ShaderStage stage = getLgcShaderStage(entryStage);
+    if (stage != lgc::ShaderStageVertex && !m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
       LLPC_OUTS("Inlining disabled!");
       func.addFnAttr(Attribute::NoInline);
     }

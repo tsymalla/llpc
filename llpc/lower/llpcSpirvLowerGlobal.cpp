@@ -2073,13 +2073,13 @@ void SpirvLowerGlobal::cleanupReturnBlock() {
 }
 
 void SpirvLowerGlobal::passProxyVariablesToFuncs() {
-  std::unordered_map<Value *, Value *> proxyMap;
+  std::list<std::pair<Value *, Value *>> proxyMap;
   for (auto &inputTuple : m_inputProxyMap)
-    proxyMap[inputTuple.first] = inputTuple.second;
+    proxyMap.emplace_back(inputTuple.first, inputTuple.second);
   for (auto &outputTuple : m_outputProxyMap)
-    proxyMap[outputTuple.first] = outputTuple.second;
+    proxyMap.emplace_back(outputTuple.first, outputTuple.second);
   for (auto &globalVarTuple : m_globalVarProxyMap)
-    proxyMap[globalVarTuple.first] = globalVarTuple.second;
+    proxyMap.emplace_back(globalVarTuple.first, globalVarTuple.second);
 
   auto IP = m_builder->GetInsertPoint();
 
@@ -2126,14 +2126,14 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs() {
 
     lgc::Pipeline::setShaderStageToFunc(clone, lgc::Pipeline::getShaderStageFromFunc(&function));
 
-    // Name the argments
+    // Name the arguments
     for (unsigned idx = 0; idx != args.size(); ++idx) {
       Argument *arg = clone->getArg(idx);
       auto *oldArg = args[idx];
       arg->setName(oldArg->getName() + "arg." + std::to_string(funcIndex));
     }
 
-    // Replace all users of non-proxy args with the clone argment
+    // Replace all users of non-proxy args with the clone argument
     std::unordered_map<llvm::Value *, SmallVector<Instruction *, 4>> argUsers;
     for (unsigned idx = 0; idx < function.arg_size(); ++idx) {
       auto *oldArg = args[idx];
@@ -2198,6 +2198,10 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs() {
       argTys.push_back(newFunc->getArg(idx)->getType());
     }
 
+    // All calls to intrinsics need to be adjusted so that they use the arguments 
+    // of the current caller instead of the from the old function.
+    // TODO
+    
     // Replace all calls to the old function with calls to the new function
     SmallVector<CallInst *, 2> oldUsers;
     for (auto *user : functionTuple.first->users()) {
