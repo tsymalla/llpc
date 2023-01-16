@@ -155,7 +155,7 @@ bool PatchResourceCollect::runImpl(Module &module, PipelineShadersResult &pipeli
 
     m_shaderStage = getShaderStage(&func);
     // Skip non-inlined functions.
-    if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage) || func.isNoInline())
+    if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage) || func.isDelayedInline())
       continue;
     m_entryPoint = &func;
     processShader();
@@ -3285,7 +3285,7 @@ void PatchResourceCollect::scalarizeForInOutPacking(Module *module) {
       // This is a generic (possibly interpolated) input. Find its uses in {TCS, GS, FS}.
       for (User *user : func.users()) {
         auto call = cast<CallInst>(user);
-        if (call->getFunction()->isNoInline())
+        if (call->getFunction()->isDelayedInline())
           continue;
 
         ShaderStage shaderStage = m_pipelineShaders->getShaderStage(call->getFunction());

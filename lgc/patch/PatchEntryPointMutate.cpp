@@ -186,6 +186,8 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
     m_shaderStage = ShaderStageCompute;
     processFuncs(&shaderInputs, module, ShaderStageCompute, pipelineShaders);
   }
+
+  patchEntryPointArgUsesInFunctions();
   
   // Fix up shader input uses to use entry args.
   shaderInputs.fixupUses(*m_module, m_pipelineState);
@@ -195,6 +197,42 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   m_userDataUsage.clear();
 
   return true;
+}
+
+void PatchEntryPointMutate::patchEntryPointArgUsesInFunctions() {
+  struct UserTuple {
+    ShaderStage stage;
+    Value *Arg;
+    Value *User;
+    std::size_t ArgIndex;
+  };
+
+  SmallVector<UserTuple, 4> usersToProcess;
+
+  // Create a unique list of each entry point argument thats being used inside a function 
+  // but does not belong to the argument list of the caller 
+  for (unsigned shaderStage = 0; shaderStage < ShaderStageNativeStageCount; ++shaderStage) {
+    auto &ArgList = entryPointArgs[static_cast<ShaderStage>(shaderStage)];
+    for (std::size_t ArgIdx = 0; ArgIdx < ArgList.size(); ++ArgIdx) {
+      Argument *Arg = ArgList[ArgIdx];
+      for (User *User: Arg->users()) {
+        Instruction *I = cast<Instruction>(User);
+        if (I && I->getFunction()->isDelayedInline() && I->getFunction() != Arg->getParent()) {
+          usersToProcess.push_back({ static_cast<ShaderStage>(shaderStage), Arg, User, ArgIdx });
+        }
+      }
+    }
+  }
+
+  while (!usersToProcess.empty()) {
+    const auto &tuple = usersToProcess.pop_back_val();
+    // Find the function of the user
+    // Find the correct argument by using the ArgIndex
+    // Replace all uses inside the function scope of the old arg with the new arg
+    Function *userFunc = cast<Instruction>(tuple.User)->getFunction();
+    Argument *newArg = getFunctionArgumentWithOffset(userFunc, tuple.ArgIndex);
+    cast<Instruction>(tuple.User)->replaceUsesOfWith(tuple.Arg, newArg);
+  }
 }
 
 // =====================================================================================================================
@@ -763,7 +801,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
 
     setFuncAttrs(newFunc);
 
-    if (m_shaderStage == ShaderStageCompute) {
+    if (m_shaderStage == ShaderStageCompute && entryPointArgs[ShaderStageCompute].empty()) {
       for (Argument &Arg : newFunc->args())
         entryPointArgs[m_shaderStage].push_back(&Arg);
     }
@@ -810,14 +848,14 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
           func.setCallingConv(CallingConv::AMDGPU_Gfx);
         }
       } else if (&func != entryPoint) {
-        if (func.isNoInline()) {
+        if (func.isDelayedInline()) {
           func.setCallingConv(CallingConv::AMDGPU_Gfx);
           processedNoInlineFuncs[&func] = true;
         }
 
         origFuncs.push_back(&func);
       }
-    } else if (!processedNoInlineFuncs[&func] && func.isNoInline() && getShaderStage(&func) == shaderStage) {
+    } else if (!processedNoInlineFuncs[&func] && func.isDelayedInline() && getShaderStage(&func) == shaderStage) {
       func.setCallingConv(CallingConv::AMDGPU_Gfx);
       origFuncs.push_back(&func);
       processedNoInlineFuncs[&func] = true;
@@ -871,7 +909,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
 
-      if (!func.isDeclaration() && (m_shaderStage == ShaderStageCompute || func.isNoInline())) {
+      if (!func.isDeclaration() && (m_shaderStage == ShaderStageCompute || func.isDelayedInline())) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           argTys.push_back(func.getArg(idx + argOffset)->getType());
           args.push_back(func.getArg(idx + argOffset));
@@ -880,7 +918,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
 
       Function *callee = call->getCalledFunction();
       // TODO fix
-      if (callee && callee->isNoInline()) {
+      if (callee && callee->isDelayedInline()) {
         // Fixup the call with the entry point args.
         builder.SetInsertPoint(call);
 

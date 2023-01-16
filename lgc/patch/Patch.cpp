@@ -72,8 +72,11 @@
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/GlobalOpt.h"
 #include "llvm/Transforms/IPO/IROutliner.h"
+#include "llvm/Transforms/IPO/PartialInlining.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/IPO/ModuleInliner.h"
 #include "llvm/Transforms/IPO/SCCP.h"
+#include "llvm/Transforms/IPO/SROA.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
@@ -216,7 +219,11 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   MPM.addPass(DeadArgumentEliminationPass());
   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(ArgumentPromotionPass()));
   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(PostOrderFunctionAttrsPass()));
-  MPM.addPass(GlobalOptPass());
+  //MPM.addPass(GlobalOptPass());
+  //MPM.addPass(IPSROAPass());
+  //MPM.addPass(PartialInlinerPass());
+  MPM.addPass(ModuleInlinerPass());
+  //MPM.addPass(DeadArgumentEliminationPass());
   //MPM.addPass(IROutlinerPass());
   passMgr.addPass(std::move(MPM));
 

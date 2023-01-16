@@ -2081,12 +2081,10 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs() {
   for (auto &globalVarTuple : m_globalVarProxyMap)
     proxyMap.emplace_back(globalVarTuple.first, globalVarTuple.second);
 
-  auto IP = m_builder->GetInsertPoint();
-
   SmallVector<std::pair<Function *, Function *>, 2> funcsToProcess;
 
   for (Function &function : *m_module)
-    if (function.isNoInline())
+    if (function.isDelayedInline())
       funcsToProcess.push_back({ &function, nullptr }); // old func / new func
   
   size_t funcIndex = 0;
@@ -2238,7 +2236,7 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs() {
     while (!oldUsers.empty()) {
       CallInst *oldCall = oldUsers.back();
       m_builder->SetInsertPoint(oldCall);
-      bool useEntryPoint = !oldCall->getFunction()->isNoInline();
+      bool useEntryPoint = !oldCall->getFunction()->isDelayedInline();
 
       SmallVector<Value *, 8> newArgs;
 
@@ -2269,8 +2267,6 @@ void SpirvLowerGlobal::passProxyVariablesToFuncs() {
     oldFunc->dropAllReferences();
     oldFunc->eraseFromParent();
   }
-
-  m_builder->SetInsertPoint(cast<Instruction>(IP));
 
   for (auto proxyTuple: proxyMap) {
     cast<GlobalVariable>(proxyTuple.first)->eraseFromParent();

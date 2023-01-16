@@ -130,6 +130,7 @@ private:
   void fixupUserDataUses(llvm::Module &module);
 
   void fixShaderStage(llvm::Function *function, ShaderStage stage);
+  void patchEntryPointArgUsesInFunctions();
   void processShader(ShaderInputs *shaderInputs, PipelineShadersResult &pipelineShaders);
   void processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders);
   void processFuncs(ShaderInputs *shaderInputs, llvm::Module &module, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders, llvm::Function *entryPoint = nullptr);
