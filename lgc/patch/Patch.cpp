@@ -214,16 +214,15 @@ void Patch::addPasses(PipelineState *pipelineState, lgc::PassManager &passMgr, b
   // adds a target feature to determine wave32 or wave64.
   passMgr.addPass(PatchSetupTargetFeatures());
 
-  // Direct function call optimization
+  // tsymalla: Direct function call optimization
   ModulePassManager MPM;
   MPM.addPass(DeadArgumentEliminationPass());
   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(ArgumentPromotionPass()));
   MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(PostOrderFunctionAttrsPass()));
-  //MPM.addPass(GlobalOptPass());
-  //MPM.addPass(IPSROAPass());
+  //MPM.addPass(ModuleInlinerPass());
+  MPM.addPass(IPSROAPass());
   //MPM.addPass(PartialInlinerPass());
-  MPM.addPass(ModuleInlinerPass());
-  //MPM.addPass(DeadArgumentEliminationPass());
+  MPM.addPass(DeadArgumentEliminationPass());
   //MPM.addPass(IROutlinerPass());
   passMgr.addPass(std::move(MPM));
 

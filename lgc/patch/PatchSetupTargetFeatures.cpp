@@ -163,6 +163,7 @@ void PatchSetupTargetFeatures::setupTargetFeatures(Module *module) {
       // Force s_barrier to be present (ignore optimization)
       builder.addAttribute("amdgpu-flat-work-group-size", "128,128");
     }
+    // tsymalla: Setup the target feature only on compute shaders or non-entry point functions called by compute
     if (func->getCallingConv() == CallingConv::AMDGPU_CS || (!func->isDelayedInline() && func->getCallingConv() == CallingConv::AMDGPU_Gfx)) {
       // Set the work group size
       const auto &computeMode = m_pipelineState->getShaderModes()->getComputeShaderMode();

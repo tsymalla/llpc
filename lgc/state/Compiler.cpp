@@ -70,10 +70,12 @@ void Pipeline::markShaderEntryPoint(Function *func, ShaderStage stage) {
   setShaderStage(func, stage);
 }
 
+// tsymalla: Set shader stage to a single func.
 void Pipeline::setShaderStageToFunc(Function *func, ShaderStage stage) {
   setShaderStage(func, stage);
 }
 
+// tsymalla: Get shader stage from a single func.
 ShaderStage Pipeline::getShaderStageFromFunc(Function *func) {
   return getShaderStage(func);
 }

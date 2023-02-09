@@ -54,10 +54,15 @@ public:
   static llvm::StringRef name() { return "Patch LLVM for entry-point mutation"; }
 
 private:
+  // tsymalla: Check whether a function is already processed.
   std::map<llvm::Function *, bool> processedNoInlineFuncs;
+  // tsymalla: Per-function map to map a function to its original argument count.
+  // With this, we know, at which index to start looking for the entry point arguments.
   llvm::SmallDenseMap<llvm::Function *, std::size_t> noInlineFuncArgOffsets;
+  // tsymalla: Per-Shader stage map to set of entry point arguments.
   std::map<ShaderStage, llvm::SmallVector<llvm::Argument *>> entryPointArgs;
   
+  // tsymalla: Lookup a function in the argument count map and get a offsetted argument by
   llvm::Argument *getFunctionArgumentWithOffset(llvm::Function *func, unsigned idx) {
     std::size_t offset = 0;
     if (func) {

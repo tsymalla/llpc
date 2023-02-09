@@ -187,6 +187,7 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
     processFuncs(&shaderInputs, module, ShaderStageCompute, pipelineShaders);
   }
 
+  // tsymalla: Let the DelayInline functions use the new arguments.
   patchEntryPointArgUsesInFunctions();
   
   // Fix up shader input uses to use entry args.
@@ -199,6 +200,8 @@ bool PatchEntryPointMutate::runImpl(Module &module, PipelineShadersResult &pipel
   return true;
 }
 
+// tsymalla: Make sure the correct entry point arguments are being used 
+// inside the non-entry point functions.
 void PatchEntryPointMutate::patchEntryPointArgUsesInFunctions() {
   struct UserTuple {
     ShaderStage stage;
@@ -209,7 +212,7 @@ void PatchEntryPointMutate::patchEntryPointArgUsesInFunctions() {
 
   SmallVector<UserTuple, 4> usersToProcess;
 
-  // Create a unique list of each entry point argument thats being used inside a function 
+  // tsymalla: Create a unique list of each entry point argument that is being used inside a function 
   // but does not belong to the argument list of the caller 
   for (unsigned shaderStage = 0; shaderStage < ShaderStageNativeStageCount; ++shaderStage) {
     auto &ArgList = entryPointArgs[static_cast<ShaderStage>(shaderStage)];
@@ -460,6 +463,7 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
     ShaderStage stage = getShaderStage(&func);
     auto userDataUsage = getUserDataUsage(stage);
 
+    // tsymalla: By using getFunctionArgumentWithOffset, it is made sure that the correct argument is being used.
     // If needed, generate code for the spill table pointer (as pointer to i8) at the start of the function.
     Instruction *spillTable = nullptr;
     AddressExtender addressExtender(&func);
@@ -698,6 +702,8 @@ void PatchEntryPointMutate::fixupUserDataUses(Module &module) {
   }
 }
 
+// tsymalla: Lookup shader stage from the function metadata to make sure the correct shader stage
+// is used.
 void PatchEntryPointMutate::fixShaderStage(llvm::Function *function, ShaderStage stage) {
   if (function->isDeclaration())
     return;
@@ -767,18 +773,23 @@ void PatchEntryPointMutate::processShader(ShaderInputs *shaderInputs, PipelineSh
   // Remove original entry-point
   origEntryPoint->eraseFromParent();
 
-  // Copy entry point arguments
+  // tsymalla: Store all entry point arguments in a per-shader stage map.
   for (Argument &Arg : entryPoint->args()) {
     entryPointArgs[m_shaderStage].push_back(&Arg);
   }
 
-  // We have all entry point arguments when we reach this point, so all NoInline funcs 
+  // tsymalla:  We have all entry point arguments when we reach this point, so all DelayInline funcs 
   // can get the entry point args as well.
   processFunc(shaderInputs, entryPoint, m_shaderStage, pipelineShaders);
   processFuncs(shaderInputs, *entryPoint->getParent(), m_shaderStage, pipelineShaders, entryPoint);
 }
 
+// tsymalla: Extracted the logic to process a single function from PatchEntryPointMutate::processFuncs
+// Includes specific handling to make sure the correct shader stage is being used.
 void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Function *function, ShaderStage shaderStage, PipelineShadersResult &pipelineShaders) {
+  // tsymalla: Re-fetch the shader stage, as looping over the shader stage in the caller is not sufficient to handle all
+  // functions appropriately, could be differently by collecting all functions with a specific shader stage and then 
+  // processing them in a batch. 
   fixShaderStage(function, shaderStage);
 
   auto *origType = function->getFunctionType();
@@ -790,17 +801,24 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
   uint64_t inRegMask = generateEntryPointArgTys(shaderInputs, shaderInputTys, shaderInputNames, 0);
   int origNumArgs = argOffset;
   const bool isEntryPointForStage = isShaderEntryPoint(function);
+
+  // tsymalla: Store the original function, as the pointer value will be replaced by the call to addFunctionArgs
   Function *funcToProcess = function;
-  
+
+  // tsymalla: Handle compute functions and non-entry point functions.
   if (m_shaderStage == ShaderStageCompute || !isEntryPointForStage) {
     // Create the new function and transfer code and attributes to it.
     uint64_t inRegMaskToUse = inRegMask;
+    // tsymalla: Create the functions and append the entry point argument list.
     Function *newFunc = addFunctionArgs(function, origType->getReturnType(), shaderInputTys, shaderInputNames, inRegMaskToUse, true);
+    
     newFunc->setCallingConv(isEntryPointForStage && m_shaderStage == ShaderStageCompute ? CallingConv::AMDGPU_CS
                                                                                         : CallingConv::AMDGPU_Gfx);
 
     setFuncAttrs(newFunc);
 
+    // tsymalla: Within compute libraries, it can happen that the argument map is filled multiple 
+    // times. Make sure this doesn't happen.
     if (m_shaderStage == ShaderStageCompute && entryPointArgs[ShaderStageCompute].empty()) {
       for (Argument &Arg : newFunc->args())
         entryPointArgs[m_shaderStage].push_back(&Arg);
@@ -817,6 +835,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
     }
 
     // Remove original function.
+    // tsymalla: Store original argument count to compute the correct offset later.
     argOffset = origType->getNumParams();
     funcToProcess = newFunc;
     noInlineFuncArgOffsets[funcToProcess] = origNumArgs;
@@ -824,6 +843,7 @@ void PatchEntryPointMutate::processFunc(ShaderInputs *shaderInputs, llvm::Functi
     function->eraseFromParent();
   }
 
+  // tsymalla: Generally handle function calls for all types of shaders
   processCalls(*funcToProcess, shaderInputTys, shaderInputNames, inRegMask, argOffset, pipelineShaders);
 }
 
@@ -848,6 +868,7 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
           func.setCallingConv(CallingConv::AMDGPU_Gfx);
         }
       } else if (&func != entryPoint) {
+        // tsymalla: Process non-entry point functions.
         if (func.isDelayedInline()) {
           func.setCallingConv(CallingConv::AMDGPU_Gfx);
           processedNoInlineFuncs[&func] = true;
@@ -856,6 +877,8 @@ void PatchEntryPointMutate::processFuncs(ShaderInputs *shaderInputs, Module &mod
         origFuncs.push_back(&func);
       }
     } else if (!processedNoInlineFuncs[&func] && func.isDelayedInline() && getShaderStage(&func) == shaderStage) {
+      // tsymalla: Make sure functions are not executed twice, with the correct shader stage.
+      // Without this, the pass is confused as a shader stage can appear multiple times.
       func.setCallingConv(CallingConv::AMDGPU_Gfx);
       origFuncs.push_back(&func);
       processedNoInlineFuncs[&func] = true;
@@ -909,6 +932,8 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         args.push_back(call->getArgOperand(idx));
       }
 
+      // tsymalla: Build the argument list for non-entry point functions, too, but use the offset 
+      // computed by the original argument count to get the correct arguments. 
       if (!func.isDeclaration() && (m_shaderStage == ShaderStageCompute || func.isDelayedInline())) {
         for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
           argTys.push_back(func.getArg(idx + argOffset)->getType());
@@ -916,20 +941,21 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         }
       }
 
+      // tsymalla: Fixup the calls with the entry point args.
       Function *callee = call->getCalledFunction();
-      // TODO fix
       if (callee && callee->isDelayedInline()) {
-        // Fixup the call with the entry point args.
         builder.SetInsertPoint(call);
 
         SmallVector<Type *, 20> newCallArgTys;
         SmallVector<Value *, 20> newCallArgs;
 
+        // tsymalla: Add the original function args.
         for (unsigned idx = 0; idx != call->arg_size(); ++idx) {
           newCallArgTys.push_back(call->getArgOperand(idx)->getType());
           newCallArgs.push_back(call->getArgOperand(idx));
         }
 
+        // tsymalla: Add the entry point args.
         for (Argument *arg: entryPointArgs[m_shaderStage]) {
           newCallArgTys.push_back(arg->getType());
           newCallArgs.push_back(arg);
@@ -941,6 +967,7 @@ void PatchEntryPointMutate::processCalls(Function &func, SmallVectorImpl<Type *>
         CallInst *newCall = builder.CreateCall(calledTy, callee, newCallArgs);
         newCall->setCallingConv(CallingConv::AMDGPU_Gfx);
 
+        // tsymalla: Mark arguments as inreg. 
         if (m_shaderStage == ShaderStageCompute || inRegMask != 0) {
           for (unsigned idx = 0; idx != shaderInputTys.size(); ++idx) {
             if ((inRegMask >> idx) & 1)

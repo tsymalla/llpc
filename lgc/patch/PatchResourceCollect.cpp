@@ -154,7 +154,8 @@ bool PatchResourceCollect::runImpl(Module &module, PipelineShadersResult &pipeli
       continue;
 
     m_shaderStage = getShaderStage(&func);
-    // Skip non-inlined functions.
+    // tsymalla: Don't run processShader for non-entry point functions, as this will result in updating the maps twice 
+    // and causes assertion failures, which are hard to debug..
     if (m_shaderStage == ShaderStage::ShaderStageInvalid || &func == pipelineShaders.getEntryPoint(m_shaderStage) || func.isDelayedInline())
       continue;
     m_entryPoint = &func;

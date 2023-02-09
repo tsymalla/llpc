@@ -260,6 +260,7 @@ bool SpirvLowerGlobal::runImpl(Module &module) {
     else
       lowerOutput();
 
+    // tsymalla: Invoke the proxy variable passing.
     if (!m_lowerInputInPlace && !m_lowerOutputInPlace) {
       passProxyVariablesToFuncs();
     }
@@ -2072,6 +2073,8 @@ void SpirvLowerGlobal::cleanupReturnBlock() {
     m_retBlock = nullptr;
 }
 
+// tsymalla: Hand over all proxy variables to the call sites, adjust the 
+// function signatures and the proxy users in the functions cope.
 void SpirvLowerGlobal::passProxyVariablesToFuncs() {
   std::list<std::pair<Value *, Value *>> proxyMap;
   for (auto &inputTuple : m_inputProxyMap)

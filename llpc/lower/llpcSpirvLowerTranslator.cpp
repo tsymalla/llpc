@@ -34,6 +34,7 @@
 #include "llpcContext.h"
 #include "lgc/Builder.h"
 #include "lgc/CommonDefs.h"
+#include "lgc/Pipeline.h"
 #include "llpcDebug.h"
 #include <sstream>
 #include <string>
@@ -188,15 +189,23 @@ void SpirvLowerTranslator::translateSpirvToLlvm(const PipelineShaderInfo *shader
       func.removeFnAttr(Attribute::NoInline);
 #endif
 
-    // For testing GravityMark, compute shaders need to be disabled, as
+    // For testing GravityMark and Q2RTX, compute shaders need to be disabled, as
     // they are not functioning properly.
     // For STK, the sampleMeshTexture0 functions need to be excluded.
+    // tsymalla: Uncomment this line and comment all others to enable inlining.
+    //func.addFnAttr(Attribute::AlwaysInline);
+
+    // tsymalla: Uncomment this line when executing function calls
     lgc::ShaderStage stage = getLgcShaderStage(entryStage);
+    // tsymalla: Uncomment for SuperTuxKart
     //if (!func.getName().startswith("sampleMeshTexture") && (stage == lgc::ShaderStageCompute || stage == lgc::ShaderStageFragment) && !m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
-    if ((stage == lgc::ShaderStageCompute || stage == lgc::ShaderStageFragment) && !m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
-    //if (stage == lgc::ShaderStageFragment && !m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
+    // tsymalla: Uncomment for everything else except GravityMark + Q2RTX
+    //if ((stage == lgc::ShaderStageCompute || stage == lgc::ShaderStageFragment) && !m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
+    // tsymalla: Uncomment for GravityMark + Q2RTX
+    if (stage == lgc::ShaderStageFragment && !m_context->getPipelineContext()->getPipelineOptions()->enableInlining) {
       LLPC_OUTS("Inlining disabled!");
       func.addFnAttr(Attribute::DelayInline);
+      lgc::Pipeline::setShaderStageToFunc(&func, stage);
     }
     else {
       LLPC_OUTS("Inlining enabled!");
