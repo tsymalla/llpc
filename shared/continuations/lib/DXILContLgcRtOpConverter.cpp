@@ -31,7 +31,7 @@
 
 #include "continuations/Continuations.h"
 #include "continuations/ContinuationsUtil.h"
-#include "lgcrt/LgcRtDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"

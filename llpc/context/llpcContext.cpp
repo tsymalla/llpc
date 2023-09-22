@@ -30,8 +30,6 @@
  */
 #include "llpcContext.h"
 #include "SPIRVInternal.h"
-#include "lgccps/LgcCpsDialect.h"
-#include "lgcrt/LgcRtDialect.h"
 #include "llpcCompiler.h"
 #include "llpcDebug.h"
 #include "llpcPipelineContext.h"
@@ -41,7 +39,9 @@
 #include "lgc/Builder.h"
 #include "lgc/GpurtDialect.h"
 #include "lgc/LgcContext.h"
+#include "lgc/LgcCpsDialect.h"
 #include "lgc/LgcDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/Bitstream/BitstreamReader.h"

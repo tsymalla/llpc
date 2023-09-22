@@ -30,10 +30,10 @@
  ***********************************************************************************************************************
  */
 #include "lgc/patch/Continufy.h"
-#include "lgccps/LgcCpsDialect.h"
-#include "lgcrt/LgcRtDialect.h"
 #include "lgc/Builder.h"
+#include "lgc/LgcCpsDialect.h"
 #include "lgc/LgcDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "lgc/patch/Patch.h"
 #include "lgc/state/PalMetadata.h"
 #include "llvm/Support/Debug.h"

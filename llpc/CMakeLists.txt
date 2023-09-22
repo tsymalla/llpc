@@ -47,8 +47,8 @@ if(ICD_BUILD_LLPC)
     include("../cmake/lgc.cmake")
     add_lgc_projects()
     # Add other LLPC dependencies as LLVM external projects.
-    list(APPEND LLVM_EXTERNAL_PROJECTS LgcRt)
-    set(LLVM_EXTERNAL_LGCRT_SOURCE_DIR ${PROJECT_SOURCE_DIR}/../shared/lgcrt)
+    list(APPEND LLVM_EXTERNAL_PROJECTS Continuations)
+    set(LLVM_EXTERNAL_CONTINUATIONS_SOURCE_DIR ${PROJECT_SOURCE_DIR}/../shared/continuations)
 
     # Set other LLVM settings.
     set(LLVM_TARGETS_TO_BUILD AMDGPU CACHE STRING Force)
@@ -130,7 +130,7 @@ if(ICD_BUILD_LLPC)
     endif()
 
     # Always link statically against libLLVMlgc
-    llvm_map_components_to_libnames(extra_llvm_libs LgcRt lgc LgcCps)
+    llvm_map_components_to_libnames(extra_llvm_libs lgc Continuations)
     if(NOT WIN32)
         foreach (lib ${extra_llvm_libs})
             target_compile_options(${lib} PRIVATE "-fno-aligned-new")

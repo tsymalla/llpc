@@ -29,7 +29,7 @@
  ***********************************************************************************************************************
  */
 
-#include "lgccps/LgcCpsDialect.h"
+#include "lgc/LgcCpsDialect.h"
 #include "lgc/ElfLinker.h"
 #include "lgc/LgcContext.h"
 #include "lgc/LgcDialect.h"

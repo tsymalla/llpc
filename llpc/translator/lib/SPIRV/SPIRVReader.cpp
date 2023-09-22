@@ -45,7 +45,7 @@
 #include "SPIRVType.h"
 #include "SPIRVUtil.h"
 #include "SPIRVValue.h"
-#include "lgcrt/LgcRtDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "llpcCompiler.h"
 #include "llpcContext.h"
 #include "llpcDialect.h"

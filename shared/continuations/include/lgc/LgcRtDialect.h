@@ -31,7 +31,7 @@
 
 #define GET_INCLUDES
 #define GET_DIALECT_DECLS
-#include "lgcrt/LgcRtDialect.h.inc"
+#include "lgc/LgcRtDialect.h.inc"
 
 namespace llvm {
 class Constant;

@@ -33,7 +33,7 @@
 #include "continuations/ContinuationsDialect.h"
 #include "continuations/ContinuationsUtil.h"
 #include "continuations/LowerRaytracingPipeline.h"
-#include "lgcrt/LgcRtDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "llvm-dialects/Dialect/Builder.h"
 #include "llvm-dialects/Dialect/Dialect.h"
 #include "llvm/Passes/PassBuilder.h"

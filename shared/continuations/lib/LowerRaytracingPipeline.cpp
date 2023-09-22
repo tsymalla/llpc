@@ -43,7 +43,7 @@
 #include "continuations/Continuations.h"
 #include "continuations/ContinuationsDialect.h"
 #include "continuations/PayloadAccessQualifiers.h"
-#include "lgcrt/LgcRtDialect.h"
+#include "lgc/LgcRtDialect.h"
 #include "llvm-dialects/Dialect/Visitor.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"

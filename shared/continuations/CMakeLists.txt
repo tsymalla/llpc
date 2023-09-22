@@ -23,6 +23,9 @@ add_llvm_library(LLVMContinuations
   lib/DXILContPreCoroutine.cpp
   lib/DXILMetadata.cpp
   lib/DXILSupport.cpp
+  lib/GpurtDialect.cpp
+  lib/LgcCpsDialect.cpp
+  lib/LgcRtDialect.cpp
   lib/LowerAwait.cpp
   lib/LowerRaytracingPipeline.cpp
   lib/PassRegistry.inc
@@ -33,7 +36,6 @@ add_llvm_library(LLVMContinuations
 
   DEPENDS
   intrinsics_gen
-  LLVMAnalysis
 
   LINK_COMPONENTS
   Analysis
@@ -50,29 +52,40 @@ target_include_directories(LLVMContinuations PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(LLVMContinuations PUBLIC llvm_dialects PRIVATE LLVMLgcRt)
+target_link_libraries(LLVMContinuations PUBLIC llvm_dialects)
 set_compiler_options(LLVMContinuations)
 
-# TableGen for continuations dialect
+# TableGen for dialects
 set(CONTINUATIONS_TABLEGEN_EXE llvm-dialects-tblgen)
 set(CONTINUATIONS_TABLEGEN_TARGET llvm-dialects-tblgen)
-set(LLVM_TARGET_DEFINITIONS include/continuations/ContinuationsDialect.td)
-set(LLVM_TARGET_DEPENDS continuations)
 
-add_custom_command(
-    OUTPUT continuations
-    COMMAND ${CMAKE_COMMAND} -E make_directory continuations)
+function(cont_tablegen NAME DIALECTNAME FILE OUTPUT_FILENAME)
+  string(REGEX REPLACE "\\..*" "" BASENAME "${DIALECTNAME}")
+  set(LLVM_TARGET_DEFINITIONS "${FILE}")
+  set(LLVM_TARGET_DEPENDS "${NAME}")
+  add_custom_command(
+      OUTPUT "${NAME}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${NAME}")
 
-tablegen(CONTINUATIONS continuations/ContinuationsDialect.h.inc -gen-dialect-decls --dialect continuations
-    EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../../imported/llvm-dialects/include)
-tablegen(CONTINUATIONS ContinuationsDialect.cpp.inc -gen-dialect-defs --dialect continuations
-    EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../../imported/llvm-dialects/include)
-add_public_tablegen_target(ContinuationsDialectTableGen)
+  tablegen(CONTINUATIONS "${BASENAME}/${OUTPUT_FILENAME}.h.inc" -gen-dialect-decls --dialect "${DIALECTNAME}"
+      EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../../imported/llvm-dialects/include)
+  tablegen(CONTINUATIONS "${OUTPUT_FILENAME}.cpp.inc" -gen-dialect-defs --dialect "${DIALECTNAME}"
+      EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../../imported/llvm-dialects/include)
+  add_public_tablegen_target("${OUTPUT_FILENAME}TableGen")
 
-add_dependencies(LLVMContinuations ContinuationsDialectTableGen LgcRtDialectTableGen)
+  add_dependencies(LLVMContinuations "${OUTPUT_FILENAME}TableGen")
+endfunction()
+
+cont_tablegen(continuations continuations include/continuations/ContinuationsDialect.td ContinuationsDialect)
+cont_tablegen(lgccps lgc.cps include/lgc/LgcCpsDialect.td LgcCpsDialect)
+cont_tablegen(lgcrt lgc.rt include/lgc/LgcRtDialect.td LgcRtDialect)
+cont_tablegen(gpurt lgc.gpurt include/lgc/GpurtDialect.td GpurtDialect)
 
 target_compile_features(LLVMContinuations PUBLIC cxx_std_17)
 set_target_properties(LLVMContinuations PROPERTIES CXX_EXTENSIONS OFF)
 
 add_subdirectory(plugin)
 add_subdirectory(test)
+if(LLPC_BUILD_TESTS)
+  add_subdirectory(unittests)
+endif()
